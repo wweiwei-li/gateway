@@ -59,7 +59,8 @@ func NewManager(ctx context.Context, cfg *config.Server, logger logging.Logger, 
 
 func newManagerForKubernetes(cfg *config.Server, errors message.RunnerErrorNotifier) (Manager, error) {
 	clientConfig := clicfg.GetConfigOrDie()
-	clientConfig.QPS, clientConfig.Burst = cfg.EnvoyGateway.Provider.Kubernetes.Client.RateLimit.GetQPSAndBurst()
+	k8sConfig := cfg.EnvoyGateway.Provider.GetKubernetesConfiguration()
+	clientConfig.QPS, clientConfig.Burst = k8sConfig.Client.RateLimit.GetQPSAndBurst()
 	cli, err := client.New(clientConfig, client.Options{Scheme: envoygateway.GetScheme()})
 	if err != nil {
 		return nil, err

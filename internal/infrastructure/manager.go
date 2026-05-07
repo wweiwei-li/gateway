@@ -9,6 +9,7 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/envoyproxy/gateway/internal/infrastructure/remote"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	clicfg "sigs.k8s.io/controller-runtime/pkg/client/config"
 
@@ -74,7 +75,7 @@ func newManagerForCustom(ctx context.Context, cfg *config.Server, logger logging
 	case egv1a1.InfrastructureProviderTypeHost:
 		return host.NewInfra(ctx, cfg, logger, errors)
 	case egv1a1.InfrastructureProviderTypeRemote:
-		return newManagerForKubernetes(cfg, errors)
+		return remote.NewInfra(cfg, errors)
 	default:
 		return nil, fmt.Errorf("unsupported provider type: %s", infra.Type)
 	}

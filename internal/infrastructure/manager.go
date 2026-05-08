@@ -62,7 +62,7 @@ func newManagerForKubernetes(cfg *config.Server, errors message.RunnerErrorNotif
 	clientConfig := clicfg.GetConfigOrDie()
 	k8sConfig := cfg.EnvoyGateway.Provider.GetKubernetesConfiguration()
 	clientConfig.QPS, clientConfig.Burst = k8sConfig.Client.RateLimit.GetQPSAndBurst()
-	cli, err := client.New(clientConfig, client.Options{Scheme: envoygateway.GetScheme()})
+	cli, err := newKubernetesClient(cfg)
 	if err != nil {
 		return nil, err
 	}
@@ -75,8 +75,23 @@ func newManagerForCustom(ctx context.Context, cfg *config.Server, logger logging
 	case egv1a1.InfrastructureProviderTypeHost:
 		return host.NewInfra(ctx, cfg, logger, errors)
 	case egv1a1.InfrastructureProviderTypeRemote:
-		return remote.NewInfra(cfg, errors)
+		var k8sClient client.Client
+		var err error
+		if cfg.EnvoyGateway.Provider.IsRunningOnKubernetes() {
+			k8sClient, err = newKubernetesClient(cfg)
+			if err != nil {
+				return nil, err
+			}
+		}
+		return remote.NewInfra(cfg, k8sClient, errors)
 	default:
 		return nil, fmt.Errorf("unsupported provider type: %s", infra.Type)
 	}
+}
+
+func newKubernetesClient(cfg *config.Server) (client.Client, error) {
+	clientConfig := clicfg.GetConfigOrDie()
+	k8sConfig := cfg.EnvoyGateway.Provider.GetKubernetesConfiguration()
+	clientConfig.QPS, clientConfig.Burst = k8sConfig.Client.RateLimit.GetQPSAndBurst()
+	return client.New(clientConfig, client.Options{Scheme: envoygateway.GetScheme()})
 }

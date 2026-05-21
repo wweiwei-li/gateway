@@ -9,7 +9,6 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/envoyproxy/gateway/internal/infrastructure/remote"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	clicfg "sigs.k8s.io/controller-runtime/pkg/client/config"
 
@@ -18,6 +17,7 @@ import (
 	"github.com/envoyproxy/gateway/internal/envoygateway/config"
 	"github.com/envoyproxy/gateway/internal/infrastructure/host"
 	"github.com/envoyproxy/gateway/internal/infrastructure/kubernetes"
+	"github.com/envoyproxy/gateway/internal/infrastructure/remote"
 	"github.com/envoyproxy/gateway/internal/ir"
 	"github.com/envoyproxy/gateway/internal/logging"
 	"github.com/envoyproxy/gateway/internal/message"

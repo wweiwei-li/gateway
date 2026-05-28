@@ -26,6 +26,7 @@ import (
 var (
 	_ Manager = (*kubernetes.Infra)(nil)
 	_ Manager = (*host.Infra)(nil)
+	_ Manager = (*remote.Infra)(nil)
 )
 
 // Manager provides the scaffolding for managing infrastructure.
@@ -83,7 +84,7 @@ func newManagerForCustom(ctx context.Context, cfg *config.Server, logger logging
 				return nil, err
 			}
 		}
-		return remote.NewInfra(cfg, k8sClient, errors)
+		return remote.NewInfra(cfg, remote.DefaultInfraClientFactory(cfg, k8sClient), errors), nil
 	default:
 		return nil, fmt.Errorf("unsupported provider type: %s", infra.Type)
 	}

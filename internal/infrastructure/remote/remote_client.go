@@ -28,6 +28,10 @@ type InfraClient interface {
 	DeleteProxyInfra(ctx context.Context, infra *ir.Infra) error
 	CreateOrUpdateRateLimitInfra(ctx context.Context) error
 	DeleteRateLimitInfra(ctx context.Context) error
+	// Conn returns the underlying gRPC client connection so its connectivity
+	// can be observed for reconnect-driven resync. It returns nil if the
+	// client is not backed by an observable connection (e.g. in tests).
+	Conn() *grpc.ClientConn
 }
 
 // InfraClientFactory builds an InfraClient on demand. Infra invokes the
@@ -54,6 +58,13 @@ func (i *infraClientImpl) Close() error {
 		return nil
 	}
 	return i.extensionConnCache.Close()
+}
+
+// Conn returns the underlying gRPC client connection, or nil if one was never
+// established. The connection is used to observe connectivity state changes so
+// that IR can be replayed when the remote provider reconnects.
+func (i *infraClientImpl) Conn() *grpc.ClientConn {
+	return i.extensionConnCache
 }
 
 // CreateOrUpdateProxyInfra serializes the IR to JSON and forwards it to the

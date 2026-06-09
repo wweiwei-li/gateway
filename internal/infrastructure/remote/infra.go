@@ -14,6 +14,7 @@ import (
 	"github.com/envoyproxy/gateway/internal/ir"
 	"github.com/envoyproxy/gateway/internal/logging"
 	"github.com/envoyproxy/gateway/internal/message"
+	"google.golang.org/grpc/connectivity"
 )
 
 // Infra manages the creation and deletion of remotely managed proxy and rate
@@ -116,4 +117,111 @@ func (i *Infra) client(ctx context.Context) (InfraClient, error) {
 	}
 	i.ic = ic
 	return ic, nil
+}
+
+// reconnectDetector tracks gRPC connectivity state transitions and reports
+// when a reconnect (a return to Ready after the transport actually failed) has
+// occurred. It deliberately does not fire on the initial connect, since the
+// initial full IR sync is handled by the runner's first Subscribe.
+//
+// Crucially, it only treats TransientFailure as "the connection dropped". A
+// gRPC channel also leaves Ready for IDLE after a period with no active RPCs
+// (the remote infra protocol sends only sporadic unary calls, so this happens
+// on a timer), and transiently passes through CONNECTING while (re)dialing.
+// Neither IDLE nor CONNECTING means the consumer lost its cache, so treating
+// them as a drop would fire a spurious full replay every idle cycle. Only a
+// genuine transport failure (a restarted/disconnected sidecar surfaces as
+// TransientFailure) arms the replay.
+//
+// It is a pure state machine so the edge-detection logic can be unit tested
+// without driving a real gRPC connection through flaky timing.
+type reconnectDetector struct {
+	seenReady bool
+	failed    bool
+}
+
+// observe records a new connectivity state and returns true if it represents a
+// reconnect edge that should trigger an IR replay.
+func (d *reconnectDetector) observe(state connectivity.State) (replay bool) {
+	switch state {
+	case connectivity.Ready:
+		switch {
+		case !d.seenReady:
+			d.seenReady = true
+		case d.failed:
+			// We previously saw a real transport failure and are now Ready
+			// again: this is a genuine reconnect.
+			d.failed = false
+			return true
+		}
+	case connectivity.TransientFailure:
+		// The transport actually failed (e.g. the sidecar restarted or the
+		// connection was dropped). Only after this does a return to Ready count
+		// as a reconnect that warrants a replay.
+		if d.seenReady {
+			d.failed = true
+		}
+	case connectivity.Idle, connectivity.Connecting:
+		// Not a failure: IDLE is gRPC parking an unused-but-healthy channel,
+		// and CONNECTING is a transitional state. Do not arm a replay; the
+		// connection is expected to return to Ready on its own (we nudge IDLE
+		// in WatchReconnect).
+	case connectivity.Shutdown:
+		// Terminal; nothing to replay.
+	}
+	return false
+}
+
+// WatchReconnect blocks and invokes onReconnect every time the gRPC connection
+// to the remote infrastructure provider transitions back to Ready after a
+// genuine transport failure (TransientFailure -> ... -> Ready).
+//
+// This is the recovery hook for the remote provider: the IR push protocol is
+// delta-based, so when the remote provider (e.g. a co-located sidecar) restarts
+// and loses its cache, EG would otherwise never re-send the unchanged IR it
+// already pushed. By replaying IR on reconnect, the remote provider is
+// rehydrated to the current state of the world without requiring an EG restart
+// or a leadership change.
+//
+// It does NOT replay on IDLE cycling: a gRPC channel drops to IDLE after a
+// period with no active RPCs, and the remote infra protocol is sporadic unary
+// traffic, so this happens routinely. Those cycles are not reconnects and must
+// not trigger a replay (see reconnectDetector).
+//
+// It returns (without error) when the InfraClient cannot be built or is not
+// backed by an observable connection, so that non-remote or test setups are
+// unaffected. It returns when ctx is cancelled or the connection is shut down.
+func (i *Infra) WatchReconnect(ctx context.Context, onReconnect func(context.Context)) {
+	ic, err := i.client(ctx)
+	if err != nil {
+		i.logger.Error(err, "unable to build infra client; reconnect-driven IR replay is disabled")
+		return
+	}
+
+	conn := ic.Conn()
+	if conn == nil {
+		// No observable connection (e.g. unit tests). Nothing to watch.
+		return
+	}
+
+	var detector reconnectDetector
+	for {
+		state := conn.GetState()
+		if state == connectivity.Shutdown {
+			return
+		}
+		if detector.observe(state) {
+			i.logger.Info("remote infra connection re-established, replaying IR")
+			onReconnect(ctx)
+		}
+		// Nudge an Idle connection to start reconnecting so that
+		// WaitForStateChange makes progress without active RPC traffic.
+		if state == connectivity.Idle {
+			conn.Connect()
+		}
+		// Block until the state changes or the context is cancelled.
+		if !conn.WaitForStateChange(ctx, state) {
+			return
+		}
+	}
 }

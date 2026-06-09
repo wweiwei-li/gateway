@@ -13,6 +13,8 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/connectivity"
 
 	"github.com/envoyproxy/gateway/internal/envoygateway/config"
 	"github.com/envoyproxy/gateway/internal/ir"
@@ -63,6 +65,12 @@ func (f *fakeInfraClient) CreateOrUpdateRateLimitInfra(_ context.Context) error 
 func (f *fakeInfraClient) DeleteRateLimitInfra(_ context.Context) error {
 	f.deleteRLCalled = true
 	return f.deleteRLErr
+}
+
+// Conn returns nil: the fake is not backed by an observable gRPC connection,
+// so reconnect-driven replay is disabled for it.
+func (f *fakeInfraClient) Conn() *grpc.ClientConn {
+	return nil
 }
 
 // fakeFactory returns an InfraClientFactory that hands back the supplied
@@ -276,4 +284,95 @@ func TestInfra_DeleteRateLimitInfra(t *testing.T) {
 		require.ErrorIs(t, err, wantErr)
 		assert.True(t, fc.deleteRLCalled)
 	})
+}
+
+func TestReconnectDetector(t *testing.T) {
+	const (
+		ready = connectivity.Ready
+		idle  = connectivity.Idle
+		tf    = connectivity.TransientFailure
+		conn  = connectivity.Connecting
+		shut  = connectivity.Shutdown
+	)
+
+	// replayCount drives a detector through a sequence of states and returns
+	// how many reconnect edges (replays) it reported.
+	replayCount := func(states ...connectivity.State) int {
+		var d reconnectDetector
+		count := 0
+		for _, s := range states {
+			if d.observe(s) {
+				count++
+			}
+		}
+		return count
+	}
+
+	t.Run("initial_connect_does_not_replay", func(t *testing.T) {
+		// First time reaching Ready is the initial sync, handled elsewhere.
+		assert.Equal(t, 0, replayCount(conn, ready))
+	})
+
+	t.Run("ready_then_transient_failure_then_ready_replays_once", func(t *testing.T) {
+		// A genuine transport failure (e.g. sidecar restart) followed by
+		// recovery is the one case that replays.
+		assert.Equal(t, 1, replayCount(ready, tf, ready))
+	})
+
+	t.Run("transient_failure_via_connecting_replays_once", func(t *testing.T) {
+		// Real reconnect path: Ready -> TransientFailure -> Connecting -> Ready.
+		assert.Equal(t, 1, replayCount(ready, tf, conn, ready))
+	})
+
+	t.Run("idle_cycle_does_not_replay", func(t *testing.T) {
+		// IDLE is gRPC parking a healthy-but-unused channel; the watcher nudges
+		// it back to Ready. This must NOT be treated as a reconnect, otherwise
+		// every idle cycle (~every 30m of no IR changes) fires a spurious
+		// full replay.
+		assert.Equal(t, 0, replayCount(ready, idle, conn, ready))
+	})
+
+	t.Run("repeated_idle_cycles_never_replay", func(t *testing.T) {
+		assert.Equal(t, 0, replayCount(ready, idle, conn, ready, idle, conn, ready))
+	})
+
+	t.Run("two_real_failures_replay_twice", func(t *testing.T) {
+		assert.Equal(t, 2, replayCount(ready, tf, ready, tf, conn, ready))
+	})
+
+	t.Run("idle_between_failures_does_not_add_replays", func(t *testing.T) {
+		// Only the transient-failure recoveries count; interleaved idle cycles
+		// are ignored.
+		assert.Equal(t, 2, replayCount(ready, idle, ready, tf, ready, idle, ready, tf, ready))
+	})
+
+	t.Run("staying_ready_does_not_replay", func(t *testing.T) {
+		assert.Equal(t, 0, replayCount(ready, ready, ready))
+	})
+
+	t.Run("failure_without_recovery_does_not_replay", func(t *testing.T) {
+		assert.Equal(t, 0, replayCount(ready, tf, conn))
+	})
+
+	t.Run("shutdown_does_not_replay", func(t *testing.T) {
+		assert.Equal(t, 0, replayCount(ready, tf, shut))
+	})
+
+	t.Run("failure_before_ever_ready_does_not_replay", func(t *testing.T) {
+		// If we never reached Ready, a return to Ready is the initial connect.
+		assert.Equal(t, 0, replayCount(conn, tf, conn, ready))
+	})
+}
+
+func TestInfra_WatchReconnect_NoConn(t *testing.T) {
+	// When the client has no observable connection, WatchReconnect returns
+	// immediately without invoking onReconnect.
+	fc := &fakeInfraClient{}
+	infra, _ := newInfraWithFake(t, fc)
+
+	called := false
+	infra.WatchReconnect(context.Background(), func(context.Context) {
+		called = true
+	})
+	assert.False(t, called, "onReconnect must not be called without a connection")
 }

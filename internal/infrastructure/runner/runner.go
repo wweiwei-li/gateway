@@ -67,6 +67,17 @@ func (r *Runner) Start(ctx context.Context) (err error) {
 		// Create the shared ratelimit infra during startup.
 		go r.initializeRateLimitInfra(ctx)
 
+		// If the infra manager is backed by a connection that can drop and
+		// reconnect (the remote provider), replay the full IR whenever that
+		// connection is re-established. The IR push protocol is delta-based, so
+		// without this a remote provider that restarts and loses its cache
+		// would never be re-sent the unchanged IR that was already pushed. This
+		// is a no-op for the Kubernetes and Host providers, which do not
+		// implement reconnectWatcher.
+		if rw, ok := r.mgr.(reconnectWatcher); ok {
+			go rw.WatchReconnect(ctx, r.replayProxyInfra)
+		}
+
 		r.Logger.Info("started")
 		<-ctx.Done()
 		r.InfraIR.Close()
@@ -93,6 +104,48 @@ func (r *Runner) Start(ctx context.Context) (err error) {
 		go subscribeInitInfraAndCloseInfraIRMessage()
 	}
 	return err
+}
+
+// reconnectWatcher is implemented by infrastructure managers whose backing
+// transport can drop and re-establish (currently only the remote provider).
+// When implemented, the runner uses it to replay the full IR to the manager on
+// every reconnect, recovering remote providers that restarted and lost their
+// in-memory cache. Managers that do not implement it (Kubernetes, Host) are
+// unaffected.
+type reconnectWatcher interface {
+	// WatchReconnect blocks until ctx is cancelled, invoking onReconnect each
+	// time the underlying connection transitions back to a usable state after
+	// having dropped.
+	WatchReconnect(ctx context.Context, onReconnect func(context.Context))
+}
+
+// replayProxyInfra re-sends the current set of proxy Infra IR to the manager.
+// It is invoked on reconnect to rehydrate a remote provider that lost its
+// cache. It mirrors the create/update path of updateProxyInfraFromSubscription,
+// including the "skip infra without listeners" guard, but sources its entries
+// from the current state of the InfraIR map rather than from a watchable
+// update.
+func (r *Runner) replayProxyInfra(ctx context.Context) {
+	all := r.InfraIR.LoadAll()
+	r.Logger.Info("replaying proxy infra after reconnect", "count", len(all))
+	for key, val := range all {
+		if val == nil {
+			continue
+		}
+		// Skip infra without listeners, matching the subscription path.
+		if val.Proxy == nil || len(val.Proxy.Listeners) == 0 {
+			r.Logger.Info("skipping replay for infra without listeners", "key", key)
+			continue
+		}
+		if err := r.mgr.CreateOrUpdateProxyInfra(ctx, val); err != nil {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+				r.Logger.Error(err, "failed to replay proxy infra after reconnect", "key", key)
+			}
+		}
+	}
 }
 
 func (r *Runner) updateProxyInfraFromSubscription(ctx context.Context, sub <-chan watchable.Snapshot[string, *ir.Infra]) {

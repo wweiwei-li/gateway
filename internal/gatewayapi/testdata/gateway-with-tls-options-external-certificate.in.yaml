@@ -1,0 +1,36 @@
+gateways:
+  - apiVersion: gateway.networking.k8s.io/v1
+    kind: Gateway
+    metadata:
+      namespace: envoy-gateway
+      name: gateway-1
+    spec:
+      gatewayClassName: envoy-gateway-class
+      listeners:
+        - name: https
+          protocol: HTTPS
+          port: 443
+          allowedRoutes:
+            namespaces:
+              from: All
+          tls:
+            mode: Terminate
+            options:
+              gateway.envoyproxy.io/external-certificate-arn: "arn:aws:acm:us-east-1:123456789012:certificate/abc-123"
+httpRoutes:
+  - apiVersion: gateway.networking.k8s.io/v1
+    kind: HTTPRoute
+    metadata:
+      namespace: default
+      name: httproute-1
+    spec:
+      parentRefs:
+        - namespace: envoy-gateway
+          name: gateway-1
+      rules:
+        - matches:
+            - path:
+                value: "/"
+          backendRefs:
+            - name: service-1
+              port: 8080

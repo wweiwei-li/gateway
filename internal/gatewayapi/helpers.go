@@ -519,17 +519,28 @@ func irRuleName(policyNamespace, policyName string, ruleIndex int) string {
 }
 
 // irTLSConfigs produces a defaulted IR TLSConfig
-func irTLSConfigs(config *ListenerTLSConfig) *ir.TLSConfig {
-	if len(config.secrets) == 0 && config.frontendTLSValidation == nil {
+func irTLSConfigs(config *ListenerTLSConfig, tlsOptions map[gwapiv1.AnnotationKey]gwapiv1.AnnotationValue) *ir.TLSConfig {
+	hasExternalCert := hasExternalCertificateOption(tlsOptions)
+	if len(config.secrets) == 0 && config.frontendTLSValidation == nil && !hasExternalCert {
 		return nil
 	}
 
 	tlsListenerConfigs := &ir.TLSConfig{
-		Certificates: make([]ir.TLSCertificate, len(config.secrets)),
+		Certificates: make([]ir.TLSCertificate, 0, len(config.secrets)),
 	}
-	for i, tlsSecret := range config.secrets {
+	for _, tlsSecret := range config.secrets {
 		cert := getTLSCertificateFromSecret(tlsSecret)
-		tlsListenerConfigs.Certificates[i] = cert
+		tlsListenerConfigs.Certificates = append(tlsListenerConfigs.Certificates, cert)
+	}
+
+	// If no secrets are present but an external certificate option is set (e.g., ACM ARN),
+	// create a TLSCertificate using the ARN as the SDS secret name.
+	// The data plane SDS server will resolve this name to actual certificate material.
+	if len(config.secrets) == 0 && hasExternalCert {
+		arn := string(tlsOptions[ExternalCertificateOptionKey])
+		tlsListenerConfigs.Certificates = append(tlsListenerConfigs.Certificates, ir.TLSCertificate{
+			Name: arn,
+		})
 	}
 
 	if config.frontendTLSValidation != nil && config.frontendTLSValidation.ValidateError == nil {
@@ -582,8 +593,8 @@ func getTLSCertificateFromSecret(tlsSecret *corev1.Secret) ir.TLSCertificate {
 
 // irTLSConfigsForTCPListener creates an IR TLSConfig with defaults appropriate
 // for TCP/TLS routes, e.g. disabling ALPN
-func irTLSConfigsForTCPListener(config *ListenerTLSConfig) *ir.TLSConfig {
-	tlsListenerConfigs := irTLSConfigs(config)
+func irTLSConfigsForTCPListener(config *ListenerTLSConfig, tlsOptions map[gwapiv1.AnnotationKey]gwapiv1.AnnotationValue) *ir.TLSConfig {
+	tlsListenerConfigs := irTLSConfigs(config, tlsOptions)
 
 	// Envoy Gateway disables ALPN by default for non-HTTPS listeners
 	// by setting an empty slice instead of a nil slice

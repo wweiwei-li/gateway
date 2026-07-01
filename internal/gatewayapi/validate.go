@@ -444,6 +444,13 @@ func (t *Translator) validateTerminateModeAndGetTLSSecrets(
 	resources *resource.Resources,
 ) ([]*corev1.Secret, []*x509.Certificate, bool) {
 	if len(listener.TLS.CertificateRefs) == 0 {
+		// If TLS options contain an external certificate reference (e.g., ACM ARN),
+		// the listener is valid. The certificate will be resolved externally via SDS
+		// rather than from a Kubernetes Secret.
+		if hasExternalCertificateOption(listener.TLS.Options) {
+			return nil, nil, true
+		}
+
 		listener.SetCondition(
 			gwapiv1.ListenerConditionProgrammed,
 			metav1.ConditionFalse,
@@ -594,6 +601,22 @@ func (t *Translator) validateTerminateModeAndGetTLSSecrets(
 	return validSecrets, certs, true
 }
 
+// ExternalCertificateOptionKey is the TLS options key that indicates an externally-managed
+// certificate (e.g., an ACM ARN). When this key is present in listener TLS options,
+// the standard certificateRefs requirement is waived.
+const ExternalCertificateOptionKey = gwapiv1.AnnotationKey("gateway.envoyproxy.io/external-certificate-arn")
+
+// hasExternalCertificateOption checks if the TLS options map contains a recognized
+// external certificate key, indicating that TLS will be resolved externally (e.g., via SDS)
+// rather than from a Kubernetes Secret.
+func hasExternalCertificateOption(options map[gwapiv1.AnnotationKey]gwapiv1.AnnotationValue) bool {
+	if len(options) == 0 {
+		return false
+	}
+	_, exists := options[ExternalCertificateOptionKey]
+	return exists
+}
+
 // validateTLSConfiguration validates TLS configuration per protocol.
 // Returns true if the TLS spec is valid, false otherwise.
 func (t *Translator) validateTLSConfiguration(
@@ -668,12 +691,12 @@ func (t *Translator) validateTLSConfiguration(
 			}
 
 			if listener.TLS.Mode != nil && *listener.TLS.Mode == gwapiv1.TLSModeTerminate {
-				if len(listener.TLS.CertificateRefs) == 0 {
+				if len(listener.TLS.CertificateRefs) == 0 && !hasExternalCertificateOption(listener.TLS.Options) {
 					listener.SetCondition(
 						gwapiv1.ListenerConditionProgrammed,
 						metav1.ConditionFalse,
 						gwapiv1.ListenerReasonInvalid,
-						"Listener must have TLS certificate refs set for TLS mode Terminate.",
+						"Listener must have TLS certificate refs or options set for TLS mode Terminate.",
 					)
 					specValid = false
 				} else {

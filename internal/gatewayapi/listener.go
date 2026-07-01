@@ -338,6 +338,10 @@ func (t *Translator) ProcessListeners(gateways []*GatewayContext, xdsIR resource
 			containerPort := t.servicePortToContainerPort(listener.Port, gateway.envoyProxy)
 			switch listener.Protocol {
 			case gwapiv1.HTTPProtocolType, gwapiv1.HTTPSProtocolType:
+				var tlsOptions map[gwapiv1.AnnotationKey]gwapiv1.AnnotationValue
+				if listener.TLS != nil {
+					tlsOptions = listener.TLS.Options
+				}
 				irListener := &ir.HTTPListener{
 					CoreListenerDetails: ir.CoreListenerDetails{
 						Name:         irListenerName(listener),
@@ -347,7 +351,7 @@ func (t *Translator) ProcessListeners(gateways []*GatewayContext, xdsIR resource
 						Metadata:     buildListenerMetadata(listener, gateway),
 						IPFamily:     ipFamily,
 					},
-					TLS: irTLSConfigs(&listener.tls),
+					TLS: irTLSConfigs(&listener.tls, tlsOptions),
 					Path: ir.PathSettings{
 						MergeSlashes:         true,
 						EscapedSlashesAction: ir.UnescapeAndRedirect,
@@ -368,6 +372,10 @@ func (t *Translator) ProcessListeners(gateways []*GatewayContext, xdsIR resource
 				// Store the HTTPListener IR in the listener context for use in the overlapping TLS config check.
 				listener.httpIR = irListener
 			case gwapiv1.TCPProtocolType, gwapiv1.TLSProtocolType:
+				var tlsOptions map[gwapiv1.AnnotationKey]gwapiv1.AnnotationValue
+				if listener.TLS != nil {
+					tlsOptions = listener.TLS.Options
+				}
 				irListener := &ir.TCPListener{
 					CoreListenerDetails: ir.CoreListenerDetails{
 						Name:         irListenerName(listener),
@@ -382,7 +390,7 @@ func (t *Translator) ProcessListeners(gateways []*GatewayContext, xdsIR resource
 					// TLS field should be added to TCPListener as ClientTrafficPolicy will affect
 					// Listener TLS. Then TCPRoute whose TLS should be configured as Terminate just
 					// refers to the Listener TLS.
-					TLS: irTLSConfigsForTCPListener(&listener.tls),
+					TLS: irTLSConfigsForTCPListener(&listener.tls, tlsOptions),
 				}
 				xdsIR[irKey].TCP = append(xdsIR[irKey].TCP, irListener)
 			case gwapiv1.UDPProtocolType:

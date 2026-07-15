@@ -847,9 +847,16 @@ func buildDownstreamQUICTransportSocket(tlsConfig *ir.TLSConfig) (*corev3.Transp
 			SdsConfig: makeConfigSource(),
 		}
 		if cert.SDS != nil {
-			// Use external SDS server instead of ADS
-			clusterName := sdsClusterNameFromURL(cert.SDS.URL)
-			sdsConfig = sdsSecretConfig(cert.SDS.SecretName, clusterName)
+			if cert.SDS.URL == "" {
+				// Name-only: no sds_config, no cluster (external data plane resolves internally)
+				sdsConfig = &tlsv3.SdsSecretConfig{
+					Name: cert.SDS.SecretName,
+				}
+			} else {
+				// Use external SDS server instead of ADS
+				clusterName := sdsClusterNameFromURL(cert.SDS.URL)
+				sdsConfig = sdsSecretConfig(cert.SDS.SecretName, clusterName)
+			}
 		}
 		tlsCtx.DownstreamTlsContext.CommonTlsContext.TlsCertificateSdsSecretConfigs = append(
 			tlsCtx.DownstreamTlsContext.CommonTlsContext.TlsCertificateSdsSecretConfigs,
@@ -890,9 +897,16 @@ func buildXdsDownstreamTLSSocket(tlsConfig *ir.TLSConfig) (*corev3.TransportSock
 			SdsConfig: makeConfigSource(),
 		}
 		if cert.SDS != nil {
-			// Use external SDS server instead of ADS
-			clusterName := sdsClusterNameFromURL(cert.SDS.URL)
-			sdsConfig = sdsSecretConfig(cert.SDS.SecretName, clusterName)
+			if cert.SDS.URL == "" {
+				// Name-only: no sds_config, no cluster (external data plane resolves internally)
+				sdsConfig = &tlsv3.SdsSecretConfig{
+					Name: cert.SDS.SecretName,
+				}
+			} else {
+				// Use external SDS server instead of ADS
+				clusterName := sdsClusterNameFromURL(cert.SDS.URL)
+				sdsConfig = sdsSecretConfig(cert.SDS.SecretName, clusterName)
+			}
 		}
 		tlsCtx.CommonTlsContext.TlsCertificateSdsSecretConfigs = append(
 			tlsCtx.CommonTlsContext.TlsCertificateSdsSecretConfigs,

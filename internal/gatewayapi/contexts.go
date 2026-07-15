@@ -164,6 +164,7 @@ type ListenerContext struct {
 
 type ListenerTLSConfig struct {
 	secrets               []*corev1.Secret
+	sdsSecrets            []*corev1.Secret
 	certDNSNames          []string
 	frontendTLSValidation *ListenerFrontendTLSValidation
 }
@@ -328,6 +329,10 @@ func (l *ListenerContext) SetCondition(conditionType gwapiv1.ListenerConditionTy
 
 func (l *ListenerContext) SetTLSSecrets(tlsSecrets []*corev1.Secret) {
 	l.tls.secrets = tlsSecrets
+}
+
+func (l *ListenerContext) SetSDSSecrets(sdsSecrets []*corev1.Secret) {
+	l.tls.sdsSecrets = sdsSecrets
 }
 
 // RouteContext represents a generic Route object (HTTPRoute, TLSRoute, etc.)

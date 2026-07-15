@@ -16,7 +16,9 @@ import (
 )
 
 const (
-	// SDSSecretType is the type for secrets that reference SDS configuration
+	// SDSSecretType is the type for secrets that reference SDS configuration.
+	// Secrets of this type contain a "url" (SDS server UDS path) and "secretName" fields,
+	// and generate an SDS config with api_config_source pointing to a static pipe cluster.
 	SDSSecretType = "gateway.envoyproxy.io/sds"
 
 	// DefaultDeploymentReplicas is the default number of deployment replicas.

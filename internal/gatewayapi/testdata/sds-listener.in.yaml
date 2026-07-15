@@ -1,0 +1,93 @@
+gateways:
+  - apiVersion: gateway.networking.k8s.io/v1
+    kind: Gateway
+    metadata:
+      namespace: envoy-gateway
+      name: gateway-1
+    spec:
+      gatewayClassName: envoy-gateway-class
+      listeners:
+        - name: https
+          protocol: HTTPS
+          port: 443
+          tls:
+            mode: Terminate
+            certificateRefs:
+              - name: sds-listener-cert
+                kind: Secret
+          allowedRoutes:
+            namespaces:
+              from: All
+backends:
+  - apiVersion: gateway.envoyproxy.io/v1alpha1
+    kind: Backend
+    metadata:
+      name: spire-uds
+      namespace: envoy-gateway-system
+    spec:
+      endpoints:
+        - unix:
+            path: /var/run/secrets/workload-spiffe-uds/socket
+      type: Endpoints
+httpRoutes:
+  - apiVersion: gateway.networking.k8s.io/v1
+    kind: HTTPRoute
+    metadata:
+      name: httproute-1
+      namespace: envoy-gateway
+    spec:
+      parentRefs:
+        - namespace: envoy-gateway
+          name: gateway-1
+          sectionName: https
+      rules:
+        - matches:
+            - path:
+                type: Exact
+                value: "/exact"
+          backendRefs:
+            - name: service-1
+              namespace: envoy-gateway
+              port: 8080
+services:
+  - apiVersion: v1
+    kind: Service
+    metadata:
+      name: service-1
+      namespace: envoy-gateway
+    spec:
+      clusterIP: 10.11.12.13
+      ports:
+        - port: 8080
+          name: http
+          protocol: TCP
+          targetPort: 8080
+endpointSlices:
+  - apiVersion: discovery.k8s.io/v1
+    kind: EndpointSlice
+    metadata:
+      name: endpointslice-service-1
+      namespace: envoy-gateway
+      labels:
+        kubernetes.io/service-name: service-1
+    addressType: IPv4
+    ports:
+      - name: http
+        protocol: TCP
+        port: 8080
+    endpoints:
+      - addresses:
+          - "10.244.0.11"
+        conditions:
+          ready: true
+secrets:
+  - apiVersion: v1
+    kind: Secret
+    metadata:
+      name: sds-listener-cert
+      namespace: envoy-gateway
+    type: gateway.envoyproxy.io/sds
+    data:
+      # /var/run/secrets/workload-spiffe-uds/socket
+      url: L3Zhci9ydW4vc2VjcmV0cy93b3JrbG9hZC1zcGlmZmUtdWRzL3NvY2tldA==
+      secretName: ZGVmYXVsdA==  # base64 for "default"

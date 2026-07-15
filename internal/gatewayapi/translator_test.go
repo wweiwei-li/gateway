@@ -93,6 +93,21 @@ func TestTranslate(t *testing.T) {
 			BackendEnabled: true,
 			SDSEnabled:     true,
 		},
+		{
+			name:           "sds-listener",
+			BackendEnabled: true,
+			SDSEnabled:     true,
+		},
+		{
+			name:           "sds-listener-disabled",
+			BackendEnabled: true,
+			SDSEnabled:     false,
+		},
+		{
+			name:           "sds-listener-no-url",
+			BackendEnabled: true,
+			SDSEnabled:     true,
+		},
 	}
 
 	inputFiles, err := filepath.Glob(filepath.Join("testdata", "*.in.yaml"))

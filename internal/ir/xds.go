@@ -490,22 +490,23 @@ type TLSCertificate struct {
 type SDSConfig struct {
 	// SecretName is an identifier for the SDS configuration.
 	SecretName string `json:"secretName" yaml:"secretName"`
-	// URL is the URL of the SDS server
-	URL string `json:"url" yaml:"url"`
+	// URL is the URL of the SDS server. When empty, only the name is emitted
+	// in xDS without an sds_config block (name-only passthrough).
+	URL string `json:"url,omitempty" yaml:"url,omitempty"`
 
 	// TODO: support additional SDS configuration options
 	// such as TLS settings for the SDS server, or authentication credentials if needed.
 }
 
+// NewSDSConfig creates an SDSConfig from a secret of type gateway.envoyproxy.io/sds.
+// Requires "secretName" field. "url" is optional — when absent, only the name is emitted
+// in the xDS config without an sds_config block (for external data planes that resolve names internally).
 func NewSDSConfig(s *corev1.Secret) (*SDSConfig, error) {
 	sdsSecretName, hasSecretName := s.Data["secretName"]
-	sdsURLBytes, hasURL := s.Data["url"]
+	sdsURLBytes, _ := s.Data["url"]
 	// TODO: support more sds options if needed.
 	if !hasSecretName || len(sdsSecretName) == 0 {
 		return nil, fmt.Errorf("no secretName found in SDS reference secret %s/%s", s.Namespace, s.Name)
-	}
-	if !hasURL || len(sdsURLBytes) == 0 {
-		return nil, fmt.Errorf("no url found in SDS reference secret %s/%s", s.Namespace, s.Name)
 	}
 
 	return &SDSConfig{

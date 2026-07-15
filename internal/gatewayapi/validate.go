@@ -24,6 +24,7 @@ import (
 	egv1a1 "github.com/envoyproxy/gateway/api/v1alpha1"
 	"github.com/envoyproxy/gateway/internal/gatewayapi/resource"
 	"github.com/envoyproxy/gateway/internal/gatewayapi/status"
+	"github.com/envoyproxy/gateway/internal/ir"
 )
 
 func (t *Translator) validateBackendRef(backendRefContext BackendRefContext, route RouteContext,
@@ -455,6 +456,7 @@ func (t *Translator) validateTerminateModeAndGetTLSSecrets(
 
 	var errs []status.ListenerError
 	secrets := make([]*corev1.Secret, 0, len(listener.TLS.CertificateRefs))
+	sdsSecrets := make([]*corev1.Secret, 0)
 	for idx, certificateRef := range listener.TLS.CertificateRefs {
 		if certificateRef.Group != nil && string(*certificateRef.Group) != "" {
 			errs = append(errs, status.NewListenerStatusError(
@@ -518,6 +520,27 @@ func (t *Translator) validateTerminateModeAndGetTLSSecrets(
 			continue
 		}
 
+		// Check if this is an SDS reference secret
+		if secret.Type == egv1a1.SDSSecretType {
+			if !t.SDSSecretRefEnabled {
+				errs = append(errs, status.NewListenerStatusError(
+					fmt.Errorf("certificate refs %d: SDS Secret reference is not enabled in EnvoyGateway configuration.", idx),
+					gwapiv1.ListenerReasonInvalidCertificateRef,
+				))
+				continue
+			}
+			// Validate SDS secret has required fields
+			if _, err := ir.NewSDSConfig(secret); err != nil {
+				errs = append(errs, status.NewListenerStatusError(
+					fmt.Errorf("certificate refs %d: invalid SDS reference secret %s/%s: %w", idx, secretNamespace, certificateRef.Name, err),
+					gwapiv1.ListenerReasonInvalidCertificateRef,
+				))
+				continue
+			}
+			sdsSecrets = append(sdsSecrets, secret)
+			continue
+		}
+
 		if secret.Type != corev1.SecretTypeTLS {
 			errs = append(errs, status.NewListenerStatusError(
 				fmt.Errorf("certificate refs %d: Secret %s/%s must be of type %s.", idx, secretNamespace, certificateRef.Name, corev1.SecretTypeTLS),
@@ -537,7 +560,7 @@ func (t *Translator) validateTerminateModeAndGetTLSSecrets(
 		secrets = append(secrets, secret)
 	}
 
-	if len(secrets) == 0 {
+	if len(secrets) == 0 && len(sdsSecrets) == 0 {
 		// Use RefNotPermitted only if ALL errors are RefNotPermitted
 		// Otherwise use InvalidCertificateRef as the general catch-all
 		reason := gwapiv1.ListenerReasonRefNotPermitted
@@ -561,6 +584,13 @@ func (t *Translator) validateTerminateModeAndGetTLSSecrets(
 		)
 
 		return nil, nil, false
+	}
+
+	// If we only have SDS secrets (no regular TLS secrets), we can skip cert parsing
+	// and return immediately with the SDS secrets stored on the listener.
+	if len(secrets) == 0 && len(sdsSecrets) > 0 {
+		listener.SetSDSSecrets(sdsSecrets)
+		return nil, nil, true
 	}
 
 	validSecrets, certs, err := parseCertsFromTLSSecretsData(secrets)
@@ -590,6 +620,10 @@ func (t *Translator) validateTerminateModeAndGetTLSSecrets(
 			status.ListenerReasonPartiallyInvalidCertificateRef,
 			fmt.Sprintf("Some secrets are invalid: %v", errors.Join(errList...)),
 		)
+	}
+	// Store SDS secrets on the listener if any were found alongside regular secrets
+	if len(sdsSecrets) > 0 {
+		listener.SetSDSSecrets(sdsSecrets)
 	}
 	return validSecrets, certs, true
 }

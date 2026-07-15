@@ -1,0 +1,20 @@
+- clusterName: httproute/envoy-gateway/httproute-1/rule/0
+  endpoints:
+  - lbEndpoints:
+    - endpoint:
+        address:
+          socketAddress:
+            address: 10.244.0.11
+            portValue: 8080
+      loadBalancingWeight: 1
+    loadBalancingWeight: 1
+    locality:
+      region: httproute/envoy-gateway/httproute-1/rule/0/backend/0
+    metadata:
+      filterMetadata:
+        envoy-gateway:
+          resources:
+          - kind: Service
+            name: service-1
+            namespace: envoy-gateway
+            sectionName: "8080"

@@ -1,0 +1,81 @@
+gateways:
+  - apiVersion: gateway.networking.k8s.io/v1
+    kind: Gateway
+    metadata:
+      namespace: envoy-gateway
+      name: gateway-1
+    spec:
+      gatewayClassName: envoy-gateway-class
+      listeners:
+        - name: https
+          protocol: HTTPS
+          port: 443
+          tls:
+            mode: Terminate
+            certificateRefs:
+              - name: sds-listener-no-url-cert
+                kind: Secret
+          allowedRoutes:
+            namespaces:
+              from: All
+httpRoutes:
+  - apiVersion: gateway.networking.k8s.io/v1
+    kind: HTTPRoute
+    metadata:
+      name: httproute-1
+      namespace: envoy-gateway
+    spec:
+      parentRefs:
+        - namespace: envoy-gateway
+          name: gateway-1
+          sectionName: https
+      rules:
+        - matches:
+            - path:
+                type: Exact
+                value: "/exact"
+          backendRefs:
+            - name: service-1
+              namespace: envoy-gateway
+              port: 8080
+services:
+  - apiVersion: v1
+    kind: Service
+    metadata:
+      name: service-1
+      namespace: envoy-gateway
+    spec:
+      clusterIP: 10.11.12.13
+      ports:
+        - port: 8080
+          name: http
+          protocol: TCP
+          targetPort: 8080
+endpointSlices:
+  - apiVersion: discovery.k8s.io/v1
+    kind: EndpointSlice
+    metadata:
+      name: endpointslice-service-1
+      namespace: envoy-gateway
+      labels:
+        kubernetes.io/service-name: service-1
+    addressType: IPv4
+    ports:
+      - name: http
+        protocol: TCP
+        port: 8080
+    endpoints:
+      - addresses:
+          - "10.244.0.11"
+        conditions:
+          ready: true
+secrets:
+  - apiVersion: v1
+    kind: Secret
+    metadata:
+      name: sds-listener-no-url-cert
+      namespace: envoy-gateway
+    type: gateway.envoyproxy.io/sds
+    data:
+      # No url field — name-only passthrough for external data planes
+      secretName: YXJuOmF3czphY206dXMtZWFzdC0xOjEyMzQ1Njc4OTAxMjpjZXJ0aWZpY2F0ZS9hYmMtMTIz  # base64 for "arn:aws:acm:us-east-1:123456789012:certificate/abc-123"

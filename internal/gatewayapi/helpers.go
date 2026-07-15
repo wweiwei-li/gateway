@@ -523,16 +523,27 @@ func irRuleName(policyNamespace, policyName string, ruleIndex int) string {
 
 // irTLSConfigs produces a defaulted IR TLSConfig
 func irTLSConfigs(config *ListenerTLSConfig) *ir.TLSConfig {
-	if len(config.secrets) == 0 && config.frontendTLSValidation == nil {
+	if len(config.secrets) == 0 && len(config.sdsSecrets) == 0 && config.frontendTLSValidation == nil {
 		return nil
 	}
 
 	tlsListenerConfigs := &ir.TLSConfig{
-		Certificates: make([]ir.TLSCertificate, len(config.secrets)),
+		Certificates: make([]ir.TLSCertificate, 0, len(config.secrets)+len(config.sdsSecrets)),
 	}
-	for i, tlsSecret := range config.secrets {
+	for _, tlsSecret := range config.secrets {
 		cert := getTLSCertificateFromSecret(tlsSecret)
-		tlsListenerConfigs.Certificates[i] = cert
+		tlsListenerConfigs.Certificates = append(tlsListenerConfigs.Certificates, cert)
+	}
+
+	// Add SDS-based certificates
+	for _, sdsSecret := range config.sdsSecrets {
+		sdsConfig, _ := ir.NewSDSConfig(sdsSecret)
+		if sdsConfig != nil {
+			tlsListenerConfigs.Certificates = append(tlsListenerConfigs.Certificates, ir.TLSCertificate{
+				Name: fmt.Sprintf("%s/%s", sdsSecret.Namespace, sdsSecret.Name),
+				SDS:  sdsConfig,
+			})
+		}
 	}
 
 	if config.frontendTLSValidation != nil && config.frontendTLSValidation.ValidateError == nil {

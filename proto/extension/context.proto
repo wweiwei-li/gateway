@@ -68,6 +68,29 @@ message PostTranslateExtensionContext {
 }
 
 
+// PostTLSCertificateExtensionContext identifies the listener certificate reference being
+// resolved. The referenced resource is a kind registered in
+// ExtensionManager.CertificateResources; Envoy Gateway has confirmed the reference is
+// permitted and that the resource reports Ready before invoking the hook.
+message PostTLSCertificateExtensionContext {
+    // The certificate resource the listener referenced.
+    ExtensionResource certificate_resource = 1;
+
+    // Namespace and name of the Gateway owning the listener.
+    string gateway_namespace = 2;
+    string gateway_name = 3;
+
+    // Name of the listener, as written in the Gateway spec.
+    string listener_name = 4;
+
+    // Port the listener binds.
+    uint32 listener_port = 5;
+
+    // Hostname of the listener, empty when the listener accepts any hostname.
+    string listener_hostname = 6;
+}
+
+
 // ExtensionResource stores the data for a K8s API object referenced in an HTTPRouteFilter
 // extensionRef. It is constructed from an unstructured.Unstructured marshalled to JSON. An extension
 // can marshal the bytes from this resource back into an unstructured.Unstructured and then

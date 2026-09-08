@@ -67,6 +67,7 @@ func loadKubernetesYAMLToResources(input []byte, addMissingResources bool, envoy
 		extFilter
 		extPolicy
 		extBackend
+		extCertificate
 	)
 	extGVKMap := map[string]extCategory{}
 	if envoyGateway != nil {
@@ -78,6 +79,10 @@ func loadKubernetesYAMLToResources(input []byte, addMissingResources bool, envoy
 			for _, gvk := range em.PolicyResources {
 				key := fmt.Sprintf("%s/%s/%s", gvk.Group, gvk.Version, gvk.Kind)
 				extGVKMap[key] = extPolicy
+			}
+			for _, gvk := range em.CertificateResources {
+				key := fmt.Sprintf("%s/%s/%s", gvk.Group, gvk.Version, gvk.Kind)
+				extGVKMap[key] = extCertificate
 			}
 			for _, gvk := range em.BackendResources {
 				key := fmt.Sprintf("%s/%s/%s", gvk.Group, gvk.Version, gvk.Kind)
@@ -122,6 +127,29 @@ func loadKubernetesYAMLToResources(input []byte, addMissingResources bool, envoy
 		}
 
 		requiredNamespaceMap.Insert(namespace)
+
+		// Check if this resource is managed by the ExtensionManager and if so, classify it.
+		//
+		// This must happen before the scheme conversion below. Extension resources are
+		// arbitrary custom kinds that are deliberately not registered in the scheme, so
+		// combinedScheme.New would fail on them. They are kept unstructured and none of
+		// the converted object is needed here.
+		if len(extGVKMap) > 0 {
+			key := fmt.Sprintf("%s/%s/%s", gvk.Group, gvk.Version, gvk.Kind)
+			if category, ok := extGVKMap[key]; ok {
+				un.SetNamespace(namespace)
+				switch category {
+				case extFilter, extBackend:
+					resources.ExtensionRefFilters = append(resources.ExtensionRefFilters, *un)
+				case extPolicy:
+					resources.ExtensionServerPolicies = append(resources.ExtensionServerPolicies, *un)
+				case extCertificate:
+					resources.ExtensionCertificates = append(resources.ExtensionCertificates, *un)
+				}
+				return nil
+			}
+		}
+
 		kobj, err := combinedScheme.New(gvk)
 		if err != nil {
 			return err
@@ -140,21 +168,6 @@ func loadKubernetesYAMLToResources(input []byte, addMissingResources bool, envoy
 		spec := kobjVal.FieldByName("Spec")
 		data := kobjVal.FieldByName("Data")
 		stringData := kobjVal.FieldByName("StringData")
-
-		// Check if this resource is managed by the ExtensionManager and if so, classify it
-		if len(extGVKMap) > 0 {
-			key := fmt.Sprintf("%s/%s/%s", gvk.Group, gvk.Version, gvk.Kind)
-			if category, ok := extGVKMap[key]; ok {
-				un.SetNamespace(namespace)
-				switch category {
-				case extFilter, extBackend:
-					resources.ExtensionRefFilters = append(resources.ExtensionRefFilters, *un)
-				case extPolicy:
-					resources.ExtensionServerPolicies = append(resources.ExtensionServerPolicies, *un)
-				}
-				return nil
-			}
-		}
 
 		switch gvk.Kind {
 		case KindEnvoyProxy:

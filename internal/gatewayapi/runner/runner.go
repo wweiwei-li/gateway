@@ -312,6 +312,7 @@ func (r *Runner) subscribeAndTranslate(sub <-chan watchable.Snapshot[string, *re
 					EnvoyPatchPolicyEnabled:         r.EnvoyGateway.ExtensionAPIs != nil && r.EnvoyGateway.ExtensionAPIs.EnableEnvoyPatchPolicy,
 					BackendEnabled:                  r.EnvoyGateway.ExtensionAPIs != nil && r.EnvoyGateway.ExtensionAPIs.EnableBackend,
 					SDSSecretRefEnabled:             r.EnvoyGateway.ExtensionAPIs != nil && r.EnvoyGateway.ExtensionAPIs.EnableSDSSecretRef,
+					ExtensionCertificateGroupKinds:  extensionCertificateGroupKinds(r.EnvoyGateway),
 					ControllerNamespace:             r.ControllerNamespace,
 					GatewayNamespaceMode:            r.EnvoyGateway.GatewayNamespaceMode(),
 					MergeGateways:                   gatewayapi.IsMergeGatewaysEnabled(resources),
@@ -1007,4 +1008,22 @@ func hmac(ctx context.Context, namespace string) ([]byte, error) {
 			"HMAC secret not found in secret %s/%s", namespace, hmacSecretName)
 	}
 	return hmac, err
+}
+
+// extensionCertificateGroupKinds collects the resource kinds registered as listener
+// certificate sources across all configured extension managers. A listener's
+// tls.certificateRefs may reference these kinds; the referenced certificate is resolved by
+// the owning extension server rather than read from a Secret.
+func extensionCertificateGroupKinds(eg *egv1a1.EnvoyGateway) []schema.GroupKind {
+	if eg == nil {
+		return nil
+	}
+
+	var gks []schema.GroupKind
+	for _, em := range eg.GetExtensionManagers() {
+		for _, gvk := range em.CertificateResources {
+			gks = append(gks, schema.GroupKind{Group: gvk.Group, Kind: gvk.Kind})
+		}
+	}
+	return gks
 }

@@ -10,6 +10,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	discoveryv1 "k8s.io/api/discovery/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -167,7 +168,11 @@ type ListenerContext struct {
 }
 
 type ListenerTLSConfig struct {
-	secrets               []*corev1.Secret
+	secrets []*corev1.Secret
+	// extensionCertificates holds listener certificates resolved from a kind registered
+	// in ExtensionManager.CertificateResources. Envoy Gateway never reads key material
+	// for these; an extension server decides how Envoy obtains the certificate.
+	extensionCertificates []unstructured.Unstructured
 	certDNSNames          []string
 	frontendTLSValidation *ListenerFrontendTLSValidation
 }
@@ -332,6 +337,10 @@ func (l *ListenerContext) SetCondition(conditionType gwapiv1.ListenerConditionTy
 
 func (l *ListenerContext) SetTLSSecrets(tlsSecrets []*corev1.Secret) {
 	l.tls.secrets = tlsSecrets
+}
+
+func (l *ListenerContext) SetTLSExtensionCertificates(certs []unstructured.Unstructured) {
+	l.tls.extensionCertificates = certs
 }
 
 // RouteContext represents a generic Route object (HTTPRoute, TLSRoute, etc.)

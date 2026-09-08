@@ -552,6 +552,14 @@ func checkOverlappingCertificates(httpsListeners []*ListenerContext) {
 		}
 		validListenerCountByPort[listener.Port]++
 
+		// An extension-resolved certificate is as opaque to Envoy Gateway as an SDS-backed
+		// one: there is no certificate to parse, so its SANs are unknown and overlap
+		// detection cannot reason about it.
+		if len(listener.tls.extensionCertificates) > 0 {
+			sdsListenersByPort[listener.Port] = append(sdsListenersByPort[listener.Port], listener)
+			continue
+		}
+
 		for _, secret := range listener.tls.secrets {
 			if secret.Type == egv1a1.SDSSecretType {
 				sdsListenersByPort[listener.Port] = append(sdsListenersByPort[listener.Port], listener)

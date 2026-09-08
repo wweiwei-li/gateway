@@ -8,6 +8,7 @@ package validation
 import (
 	"fmt"
 	"net/url"
+	"slices"
 	"strings"
 	"time"
 
@@ -312,9 +313,62 @@ func validateEnvoyGatewayExtensionManager(extensionManager *egv1a1.ExtensionMana
 		return fmt.Errorf("registered extension has no hooks specified")
 	}
 
+	if err := validateExtensionCertificateResources(extensionManager); err != nil {
+		return err
+	}
+
 	err := validateExtensionService(extensionManager.Service)
 	if err != nil {
 		return err
+	}
+
+	return nil
+}
+
+// validateExtensionCertificateResources enforces the constraints specific to
+// certificate resolution, which differ from the other resource categories.
+func validateExtensionCertificateResources(extensionManager *egv1a1.ExtensionManager) error {
+	if len(extensionManager.CertificateResources) == 0 {
+		return nil
+	}
+
+	// A certificate kind is meaningless without a hook to resolve it with.
+	if !slices.Contains(extensionManager.Hooks.XDSTranslator.Post, egv1a1.XDSTLSCertificate) {
+		return fmt.Errorf("certificateResources requires the %s hook to be registered", egv1a1.XDSTLSCertificate)
+	}
+
+	// Skipping a failed certificate extension yields a listener with no certificate,
+	// which fails closed regardless. Allowing failOpen here would suggest a listener
+	// can be served without a certificate, so it is rejected rather than silently
+	// having no useful meaning.
+	if extensionManager.FailOpen {
+		return fmt.Errorf("failOpen is not supported for an extension registering certificateResources")
+	}
+
+	// A certificate ref is resolved by the extension owning its group and kind, so
+	// ownership must be unambiguous within a single manager as well as across them.
+	seen := make(map[egv1a1.GroupVersionKind]struct{}, len(extensionManager.CertificateResources))
+	for _, gvk := range extensionManager.CertificateResources {
+		if gvk.Group == "" || gvk.Version == "" || gvk.Kind == "" {
+			return fmt.Errorf("certificateResources entries must specify group, version and kind")
+		}
+		if _, dup := seen[gvk]; dup {
+			return fmt.Errorf("certificateResources contains duplicate entry %s/%s %s", gvk.Group, gvk.Version, gvk.Kind)
+		}
+		seen[gvk] = struct{}{}
+
+		// Overlap with another category would make the same object both a certificate
+		// source and a policy or filter, with no defined precedence.
+		for name, other := range map[string][]egv1a1.GroupVersionKind{
+			"resources":        extensionManager.Resources,
+			"policyResources":  extensionManager.PolicyResources,
+			"backendResources": extensionManager.BackendResources,
+		} {
+			if slices.Contains(other, gvk) {
+				return fmt.Errorf("%s/%s %s is registered as both a certificateResource and in %s",
+					gvk.Group, gvk.Version, gvk.Kind, name)
+			}
+		}
 	}
 
 	return nil

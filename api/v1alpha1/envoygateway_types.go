@@ -821,6 +821,21 @@ type ExtensionManager struct {
 	// +optional
 	BackendResources []GroupVersionKind `json:"backendResources,omitempty"`
 
+	// CertificateResources defines the set of K8s resources the extension will handle as
+	// TLS certificate sources. These resources can be referenced from a Gateway or
+	// ListenerSet listener's tls.certificateRefs by group and kind, allowing a listener
+	// to serve a certificate held by an external provider instead of a Kubernetes Secret.
+	//
+	// A referenced resource is admitted only when it reports a Ready condition with
+	// status True. Envoy Gateway does not interpret the resource beyond that condition;
+	// the extension server decides how Envoy obtains the certificate, via the
+	// TLSCertificate hook.
+	//
+	// Envoy Gateway requires get, list and watch permission on every kind registered here.
+	//
+	// +optional
+	CertificateResources []GroupVersionKind `json:"certificateResources,omitempty"`
+
 	// Hooks defines the set of hooks the extension supports
 	//
 	// +kubebuilder:validation:Required

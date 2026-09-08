@@ -77,6 +77,7 @@ type gatewayAPIReconciler struct {
 	extGVKs              []schema.GroupVersionKind
 	extServerPolicies    []schema.GroupVersionKind
 	extBackendGVKs       []schema.GroupVersionKind
+	extCertificateGVKs   []schema.GroupVersionKind
 	gatewayNamespaceMode bool
 
 	backendCRDExists       bool
@@ -95,6 +96,9 @@ type gatewayAPIReconciler struct {
 	tlsRouteCRDExists      bool
 	udpRouteCRDExists      bool
 	extBackendCRDExists    map[schema.GroupVersionKind]bool
+	// extCertificateCRDExists records which registered certificate CRDs are installed, so a
+	// missing one is skipped rather than crashing the controller.
+	extCertificateCRDExists map[schema.GroupVersionKind]bool
 
 	clusterTrustBundleExits bool
 
@@ -147,6 +151,7 @@ func newGatewayAPIController(ctx context.Context, mgr manager.Manager, cfg *conf
 	var extServerPoliciesGVKs []schema.GroupVersionKind
 	var extGVKs []schema.GroupVersionKind
 	var extBackendGVKs []schema.GroupVersionKind
+	var extCertificateGVKs []schema.GroupVersionKind
 	for _, em := range cfg.EnvoyGateway.GetExtensionManagers() {
 		for _, rsrc := range em.Resources {
 			gvk := schema.GroupVersionKind(rsrc)
@@ -160,24 +165,31 @@ func newGatewayAPIController(ctx context.Context, mgr manager.Manager, cfg *conf
 			gvk := schema.GroupVersionKind(rsrc)
 			extBackendGVKs = append(extBackendGVKs, gvk)
 		}
+		for _, rsrc := range em.CertificateResources {
+			gvk := schema.GroupVersionKind(rsrc)
+			extCertificateGVKs = append(extCertificateGVKs, gvk)
+		}
 	}
 
 	r := &gatewayAPIReconciler{
-		client:               mgr.GetClient(),
-		log:                  cfg.Logger,
-		classController:      gwapiv1.GatewayController(cfg.EnvoyGateway.Gateway.ControllerName),
-		namespace:            cfg.ControllerNamespace,
-		statusUpdater:        su,
-		resources:            resources,
-		subscriptions:        &subscriptions{},
-		extGVKs:              extGVKs,
-		store:                newProviderStore(),
-		envoyGateway:         cfg.EnvoyGateway,
-		mergeGateways:        sets.New[string](),
-		extServerPolicies:    extServerPoliciesGVKs,
-		extBackendGVKs:       extBackendGVKs,
-		extBackendCRDExists:  make(map[schema.GroupVersionKind]bool),
-		gatewayNamespaceMode: cfg.EnvoyGateway.GatewayNamespaceMode(),
+		client:              mgr.GetClient(),
+		log:                 cfg.Logger,
+		classController:     gwapiv1.GatewayController(cfg.EnvoyGateway.Gateway.ControllerName),
+		namespace:           cfg.ControllerNamespace,
+		statusUpdater:       su,
+		resources:           resources,
+		subscriptions:       &subscriptions{},
+		extGVKs:             extGVKs,
+		store:               newProviderStore(),
+		envoyGateway:        cfg.EnvoyGateway,
+		mergeGateways:       sets.New[string](),
+		extServerPolicies:   extServerPoliciesGVKs,
+		extBackendGVKs:      extBackendGVKs,
+		extCertificateGVKs:  extCertificateGVKs,
+		extBackendCRDExists: make(map[schema.GroupVersionKind]bool),
+
+		extCertificateCRDExists: make(map[schema.GroupVersionKind]bool),
+		gatewayNamespaceMode:    cfg.EnvoyGateway.GatewayNamespaceMode(),
 	}
 
 	if byNamespaceSelectorEnabled(cfg.EnvoyGateway) {
@@ -545,6 +557,14 @@ func (r *gatewayAPIReconciler) Reconcile(ctx context.Context, _ reconcile.Reques
 				return reconcile.Result{}, err
 			}
 			gcLogger.Error(err, "failed to process policy target ReferenceGrants for GatewayClass")
+		}
+
+		if err = r.processExtensionCertificates(ctx, gwcResource); err != nil {
+			if isTransientError(err) {
+				gcLogger.Error(err, "transient error processing extension certificates")
+				return reconcile.Result{}, err
+			}
+			gcLogger.Error(err, "failed to process extension certificates for GatewayClass")
 		}
 
 		if err = r.processExtensionServerPolicies(ctx, gwcResource); err != nil {
@@ -3058,6 +3078,33 @@ func (r *gatewayAPIReconciler) watchResources(ctx context.Context, mgr manager.M
 		}
 		r.log.Info("Watching additional backend resource", "resource", gvk.String())
 	}
+	for _, gvk := range r.extCertificateGVKs {
+		// Skip the watch when the CRD is absent rather than failing WaitForCacheSync,
+		// matching the backend resource handling above.
+		crdExists, err := checkCRD(gvk.Kind, gvk.GroupVersion().String())
+		if err != nil {
+			return err
+		}
+		if !crdExists {
+			r.log.Info("certificate resource CRD not found, skipping watch", "resource", gvk.String())
+			continue
+		}
+		r.extCertificateCRDExists[gvk] = true
+		u := &unstructured.Unstructured{}
+		u.SetGroupVersionKind(gvk)
+		// Deliberately not using uPredicates. Those filter on generation changes, and a
+		// certificate becoming ready is a status-only update, which does not bump
+		// metadata.generation. With that filter a listener waiting on a certificate would
+		// stay unprogrammed until some unrelated event triggered a retranslation.
+		if err := c.Watch(source.Kind(mgr.GetCache(), u,
+			handler.TypedEnqueueRequestsFromMapFunc(func(ctx context.Context, si *unstructured.Unstructured) []reconcile.Request {
+				return r.enqueueClass(ctx, si)
+			}),
+			certificateResourcePredicates(r)...)); err != nil {
+			return err
+		}
+		r.log.Info("Watching additional certificate resource", "resource", gvk.String())
+	}
 
 	r.hrfCRDExists, err = checkCRD(resource.KindHTTPRouteFilter, egv1a1.GroupVersion.String())
 	if err != nil {
@@ -3557,5 +3604,49 @@ func (r *gatewayAPIReconciler) processEnvoyExtensionPolicyObjectRefs(
 			}
 		}
 	}
+	return nil
+}
+
+// certificateResourcePredicates returns the predicates for watching extension-provided
+// certificate resources.
+//
+// This intentionally omits TypedGenerationChangedPredicate, which the other extension resource
+// watches use. Readiness of a certificate is reported through its status, and a status-only
+// update leaves metadata.generation unchanged, so that predicate would filter out precisely the
+// event that must trigger a retranslation.
+func certificateResourcePredicates(r *gatewayAPIReconciler) []predicate.TypedPredicate[*unstructured.Unstructured] {
+	var predicates []predicate.TypedPredicate[*unstructured.Unstructured]
+	if r.namespaceLabel != nil {
+		predicates = append(predicates, predicate.NewTypedPredicateFuncs(func(obj *unstructured.Unstructured) bool {
+			return r.hasMatchingNamespaceLabels(obj)
+		}))
+	}
+	return predicates
+}
+
+// processExtensionCertificates adds extension-provided certificate resources to the resourceTree.
+//
+// Unlike processExtensionServerPolicies, the status is preserved. Envoy Gateway admits a listener
+// certificate reference only when the resource reports a Ready condition, so stripping the status
+// would make every such certificate read as not ready and no listener would ever be programmed.
+func (r *gatewayAPIReconciler) processExtensionCertificates(
+	ctx context.Context, resourceTree *resource.Resources,
+) error {
+	for _, gvk := range r.extCertificateGVKs {
+		if !r.extCertificateCRDExists[gvk] {
+			continue
+		}
+
+		certList := unstructured.UnstructuredList{}
+		certList.SetAPIVersion(gvk.GroupVersion().String())
+		certList.SetKind(gvk.Kind)
+
+		if err := r.client.List(ctx, &certList); err != nil {
+			return fmt.Errorf("error listing extension certificate %s: %w", gvk, err)
+		}
+
+		resourceTree.ExtensionCertificates = append(resourceTree.ExtensionCertificates, certList.Items...)
+	}
+
 	return nil
 }

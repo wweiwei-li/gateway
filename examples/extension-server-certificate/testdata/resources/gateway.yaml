@@ -1,0 +1,69 @@
+apiVersion: gateway.networking.k8s.io/v1
+kind: GatewayClass
+metadata:
+  name: eg
+spec:
+  controllerName: gateway.envoyproxy.io/gatewayclass-controller
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: eg
+  namespace: default
+spec:
+  gatewayClassName: eg
+  listeners:
+  - name: https
+    protocol: HTTPS
+    port: 10443
+    hostname: www.example.com
+    tls:
+      mode: Terminate
+      certificateRefs:
+      # Not a Secret. The kind is registered under extensionManager.certificateResources, so
+      # the reference is resolved by the extension server rather than read from the cluster.
+      - group: example.io
+        kind: ExampleCertificate
+        name: app-cert
+---
+apiVersion: example.io/v1alpha1
+kind: ExampleCertificate
+metadata:
+  name: app-cert
+  namespace: default
+spec:
+  certificateArn: "arn:aws:acm:us-east-1:123456789012:certificate/abc-123"
+status:
+  conditions:
+  # This is the admission gate. Envoy Gateway only admits the reference, and only calls the
+  # resolve hook, once this reports True. Flip it to False and the listener becomes
+  # Programmed=False with reason CertificatePending while staying Accepted=True.
+  - type: Ready
+    status: "True"
+    reason: Associated
+    message: "certificate is available on the data plane"
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: backend
+  namespace: default
+spec:
+  parentRefs:
+  - name: eg
+  hostnames:
+  - www.example.com
+  rules:
+  - backendRefs:
+    - name: backend
+      port: 3000
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: backend
+  namespace: default
+spec:
+  ports:
+  - port: 3000
+    targetPort: 3000

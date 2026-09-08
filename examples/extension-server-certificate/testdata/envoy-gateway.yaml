@@ -1,0 +1,35 @@
+apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: EnvoyGateway
+gateway:
+  controllerName: gateway.envoyproxy.io/gatewayclass-controller
+logging:
+  level:
+    default: info
+provider:
+  type: Custom
+  custom:
+    resource:
+      type: File
+      file:
+        paths: ["./resources"]
+    infrastructure:
+      type: Host
+      host: {}
+extensionManager:
+  # Envoy Gateway watches this kind and admits listener certificateRefs pointing at it.
+  # It never interprets the resource beyond its Ready condition.
+  certificateResources:
+  - group: example.io
+    version: v1alpha1
+    kind: ExampleCertificate
+  hooks:
+    xdsTranslator:
+      post:
+      - TLSCertificate
+  # Must be false. Skipping a failed certificate extension would leave the listener with no
+  # certificate, so Envoy Gateway rejects failOpen for a manager registering certificate kinds.
+  failOpen: false
+  service:
+    fqdn:
+      hostname: 127.0.0.1
+      port: 5005

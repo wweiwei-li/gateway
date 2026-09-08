@@ -60,4 +60,60 @@ type XDSHookClient interface {
 	// The list of clusters, secrets, listeners, and routes returned by the extension are used as the final list of all these resources
 	// PostTranslateModifyHook is always executed when an extension is loaded
 	PostTranslateModifyHook([]*cluster.Cluster, []*tls.Secret, []*listener.Listener, []*route.RouteConfiguration, []*ir.UnstructuredRef) ([]*cluster.Cluster, []*tls.Secret, []*listener.Listener, []*route.RouteConfiguration, error)
+
+	// PostTLSCertificateResolveHook asks an extension how Envoy should obtain a listener TLS
+	// certificate that was referenced from a kind registered in
+	// ExtensionManager.CertificateResources.
+	//
+	// It is invoked once per such certificate, after Envoy Gateway has confirmed the
+	// reference is permitted and that the resource reports Ready. Envoy Gateway emits no
+	// Secret of its own for these certificates, so no key material passes through the
+	// control plane unless the extension explicitly returns one.
+	//
+	// Unlike the other hooks, resolution is not chained: only the extension that registered
+	// the referenced group and kind is consulted.
+	PostTLSCertificateResolveHook(*TLSCertificateContext) (*TLSCertificateResolution, error)
+}
+
+// TLSCertificateContext identifies the listener certificate reference being resolved.
+type TLSCertificateContext struct {
+	// Certificate is the resource the listener referenced.
+	Certificate *unstructured.Unstructured
+
+	GatewayNamespace string
+	GatewayName      string
+
+	// ListenerName is the listener's name as written in the Gateway spec.
+	ListenerName string
+	ListenerPort uint32
+	// ListenerHostname is empty when the listener accepts any hostname.
+	ListenerHostname string
+}
+
+// TLSCertificateResolution is how Envoy should obtain one listener TLS certificate.
+type TLSCertificateResolution struct {
+	// SdsSecretConfig names the certificate and, optionally, where to fetch it from.
+	//
+	// SdsConfig may be left nil when the data plane resolves the name itself. Envoy Gateway
+	// passes a nil SdsConfig through unchanged rather than substituting a default, so the
+	// filter chain carries the name alone.
+	SdsSecretConfig *tls.SdsSecretConfig
+
+	// Clusters the SdsSecretConfig depends on. Additive only: a name colliding with an
+	// existing cluster is an error, not a replacement.
+	Clusters []*cluster.Cluster
+
+	// Secrets the extension wants Envoy Gateway to serve directly. Populating this places
+	// key material in the xDS stream.
+	Secrets []*tls.Secret
+
+	// DNSNames on the certificate. Without them Envoy Gateway must treat the certificate as
+	// opaque, which disables HTTP/2 on any port the listener shares with another HTTPS
+	// listener, since it cannot check for overlapping SANs.
+	DNSNames []string
+
+	// FailureReason and FailureMessage describe a resolution failure. When FailureReason is
+	// set the certificate is treated as unresolved.
+	FailureReason  string
+	FailureMessage string
 }

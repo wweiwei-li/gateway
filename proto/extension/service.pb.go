@@ -724,15 +724,29 @@ type PostTLSCertificateResolveResponse struct {
 	// How Envoy obtains the certificate. The name is the identifier the data plane knows the
 	// certificate by.
 	//
-	// sds_config may be left unset when the data plane resolves the name itself, in which
-	// case Envoy Gateway emits the name alone. Envoy Gateway does not substitute a default.
+	// sds_config is optional and decides how Envoy treats the name. Envoy's own semantics:
+	// "When both name and config are specified, then secret can be fetched and/or reloaded
+	// via SDS. When only name is specified, then secret will be loaded from static
+	// resources."
+	//
+	// So leaving it unset suits a data plane that resolves the name from its own store, and
+	// setting it suits a provider serving the certificate over SDS, which also gets Envoy's
+	// gentler handling of a secret that has not arrived yet: the listener warms rather than
+	// the update being rejected. Envoy Gateway substitutes no default either way.
 	SdsSecretConfig *v34.SdsSecretConfig `protobuf:"bytes,1,opt,name=sds_secret_config,json=sdsSecretConfig,proto3" json:"sds_secret_config,omitempty"`
 	// Clusters the SdsSecretConfig depends on, for a provider reached over the network
 	// rather than resolved locally by the data plane. Additive only: a name that collides
 	// with an existing cluster is an error rather than a replacement.
+	//
+	// NOT YET IMPLEMENTED. Adding a cluster means writing to the resource table, which the
+	// listener build path cannot currently reach, so a non-empty value is rejected rather
+	// than silently dropped. Until then an sds_config may only name a cluster Envoy Gateway
+	// already emits, or use a config source needing none: ADS, a filesystem path, or self.
 	Clusters []*v31.Cluster `protobuf:"bytes,2,rep,name=clusters,proto3" json:"clusters,omitempty"`
 	// Secrets the extension wants Envoy Gateway to serve directly. Populating this places
 	// key material in the xDS stream, so a provider that can avoid it should.
+	//
+	// NOT YET IMPLEMENTED, and rejected for the same reason as clusters.
 	Secrets []*v34.Secret `protobuf:"bytes,3,rep,name=secrets,proto3" json:"secrets,omitempty"`
 	// DNS names on the certificate. Envoy Gateway cannot inspect a certificate it never
 	// sees, so without these it must treat the certificate as opaque and disable HTTP/2 on

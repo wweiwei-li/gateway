@@ -20,6 +20,7 @@ import (
 	hcmv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/http_connection_manager/v3"
 	tlsv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/transport_sockets/tls/v3"
 	matcherv3 "github.com/envoyproxy/go-control-plane/envoy/type/matcher/v3"
+	cachetypes "github.com/envoyproxy/go-control-plane/pkg/cache/types"
 	resourcev3 "github.com/envoyproxy/go-control-plane/pkg/resource/v3"
 	"github.com/envoyproxy/go-control-plane/pkg/wellknown"
 	"go.opentelemetry.io/otel"
@@ -220,6 +221,10 @@ func (t *Translator) Translate(ctx context.Context, xdsIR *ir.Xds) (*types.Resou
 		errs = errors.Join(errs, err)
 	}
 
+	// Drop any listener left with nothing to serve before the extension server sees it, so a
+	// hook is never handed a listener that will not be emitted.
+	pruneEmptyTLSListeners(tCtx, t.Logger)
+
 	// This span stays at zero duration when no extension server is loaded, which is
 	// itself the answer to "are the extension hooks in play?". The hook runs once per
 	// generated xDS listener, which is what drives its duration, not the IR listeners.
@@ -306,6 +311,42 @@ func (t *Translator) Translate(ctx context.Context, xdsIR *ir.Xds) (*types.Resou
 	phases.End()
 
 	return tCtx, errs
+}
+
+// pruneEmptyTLSListeners removes listeners that ended up with no filter chains.
+//
+// A TLS filter chain is left out when every certificate it referenced went unresolved, which
+// happens when the provider refuses them -- see hasNoServableCertificate. A listener whose only
+// filter chain was dropped that way would otherwise be sent with none, and Envoy rejects the
+// entire Listener resource rather than the offending one: it keeps serving its last known good
+// config while any proxy that restarts fails to load at all.
+//
+// Dropping the listener instead means the port does not listen, so clients get a refused
+// connection. Listeners sharing a port with a chain that did resolve keep working, which is why
+// the decision is made per filter chain first and only then per listener.
+func pruneEmptyTLSListeners(tCtx *types.ResourceVersionTable, logger logging.Logger) {
+	if tCtx == nil || tCtx.XdsResources == nil {
+		return
+	}
+	listeners := tCtx.XdsResources[resourcev3.ListenerType]
+	if len(listeners) == 0 {
+		return
+	}
+	kept := make([]cachetypes.Resource, 0, len(listeners))
+	for _, r := range listeners {
+		l, ok := r.(*listenerv3.Listener)
+		// UDP listeners carry no filter chains at all -- they dispatch through listener
+		// filters -- so an empty chain list only means "nothing to serve" when there are no
+		// listener filters either.
+		if ok && len(l.GetFilterChains()) == 0 && l.GetDefaultFilterChain() == nil &&
+			len(l.GetListenerFilters()) == 0 {
+			logger.Info("dropping listener with no filter chains; no certificate resolved for it",
+				"listener", l.GetName())
+			continue
+		}
+		kept = append(kept, r)
+	}
+	tCtx.XdsResources[resourcev3.ListenerType] = kept
 }
 
 // ensureSystemTrustStoreSecret detects and repairs any tampering with system_ca_certificates

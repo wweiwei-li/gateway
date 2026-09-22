@@ -536,6 +536,11 @@ func (t *Translator) addHCMToXDSListener(
 		if err != nil {
 			return err
 		}
+		if hasNoServableCertificate(irListener.TLS, certResolutions) {
+			// Nothing resolved, so this filter chain is left out. A listener with no filter
+			// chains at all is then dropped rather than sent empty.
+			return nil
+		}
 
 		var tSocket *corev3.TransportSocket
 
@@ -760,6 +765,10 @@ func (t *Translator) addXdsTCPFilterChain(
 		if err != nil {
 			return err
 		}
+		if hasNoServableCertificate(irRoute.TLS.Terminate, certResolutions) {
+			// Nothing resolved, so no filter chain is added for this route.
+			return nil
+		}
 
 		tSocket, err := buildXdsDownstreamTLSSocket(irRoute.TLS.Terminate, certResolutions)
 		if err != nil {
@@ -899,6 +908,83 @@ func addXdsTLSInspectorFilter(xdsListener *listenerv3.Listener, fingerprints []i
 	return nil
 }
 
+// hasNoServableCertificate reports whether every certificate on a listener went unresolved,
+// leaving nothing for Envoy to serve with.
+//
+// An extension-resolved certificate is omitted when its provider refuses it, which is right while
+// another certificate remains: the listener serves a narrower set rather than going dark. When it
+// was the only certificate, the filter chain would carry an empty tls_certificate_sds_secret_configs
+// and Envoy rejects the update. The proxy carries on with its last known good config, so nothing
+// looks wrong until it restarts, at which point it has no last known good and fails to load at all.
+// Leaving the filter chain out instead means the port does not listen, which is the intended
+// failure: refused connections rather than config the data plane rejects.
+func hasNoServableCertificate(tlsConfig *ir.TLSConfig, certResolutions map[string]*tlsv3.SdsSecretConfig) bool {
+	if tlsConfig == nil || len(tlsConfig.Certificates) == 0 {
+		return false
+	}
+	for i := range tlsConfig.Certificates {
+		cert := &tlsConfig.Certificates[i]
+		if cert.ExtensionRef == nil {
+			// Secret-backed certificates are always servable: Envoy Gateway emits them itself.
+			return false
+		}
+		if resolved := certResolutions[cert.Name]; resolved != nil && resolved.GetName() != "" {
+			return false
+		}
+	}
+	return true
+}
+
+// downstreamTLSCertificateConfigs builds the SdsSecretConfig list for a listener's certificates,
+// skipping any whose name was already emitted for this filter chain.
+//
+// Valid configuration can name the same secret twice. The same certificateRef may be listed twice,
+// and two distinct extension-backed resources may resolve to one identifier -- two resources naming
+// the same underlying certificate, which Envoy Gateway cannot detect because the identifier is
+// chosen by the extension rather than derived from the resource. Envoy caps how many certificates a
+// TLS context may carry and tells them apart by key type, so emitting a name twice risks the update
+// being rejected over configuration the user was entitled to write.
+func downstreamTLSCertificateConfigs(
+	tlsConfig *ir.TLSConfig,
+	certResolutions map[string]*tlsv3.SdsSecretConfig,
+) []*tlsv3.SdsSecretConfig {
+	var configs []*tlsv3.SdsSecretConfig
+	seen := make(map[string]struct{}, len(tlsConfig.Certificates))
+
+	for _, cert := range tlsConfig.Certificates {
+		var sdsConfig *tlsv3.SdsSecretConfig
+
+		switch {
+		case cert.ExtensionRef != nil:
+			// Resolved by an extension server. The returned config is used verbatim: when the
+			// data plane resolves the name itself, SdsConfig is nil and must stay nil, so no
+			// default config source is substituted here. A certificate with no resolution is
+			// omitted so the listener fails closed.
+			resolved, ok := certResolutions[cert.Name]
+			if !ok || resolved == nil {
+				continue
+			}
+			sdsConfig = resolved
+		case cert.SDS != nil:
+			// Use external SDS server instead of ADS
+			sdsConfig = sdsSecretConfig(cert.SDS.SecretName, sdsClusterNameFromURL(cert.SDS.GetURL()))
+		default:
+			sdsConfig = &tlsv3.SdsSecretConfig{
+				Name:      cert.Name,
+				SdsConfig: makeConfigSource(),
+			}
+		}
+
+		if _, dup := seen[sdsConfig.GetName()]; dup {
+			continue
+		}
+		seen[sdsConfig.GetName()] = struct{}{}
+		configs = append(configs, sdsConfig)
+	}
+
+	return configs
+}
+
 func buildDownstreamQUICTransportSocket(tlsConfig *ir.TLSConfig, certResolutions map[string]*tlsv3.SdsSecretConfig) (*corev3.TransportSocket, error) {
 	tlsCtx := &quicv3.QuicDownstreamTransport{
 		DownstreamTlsContext: &tlsv3.DownstreamTlsContext{
@@ -909,34 +995,9 @@ func buildDownstreamQUICTransportSocket(tlsConfig *ir.TLSConfig, certResolutions
 		},
 	}
 
-	for _, cert := range tlsConfig.Certificates {
-		if cert.ExtensionRef != nil {
-			// Resolved by an extension server. A certificate with no resolution is omitted
-			// so the listener fails closed rather than referencing a secret that is never
-			// sent.
-			resolved, ok := certResolutions[cert.Name]
-			if !ok || resolved == nil {
-				continue
-			}
-			tlsCtx.DownstreamTlsContext.CommonTlsContext.TlsCertificateSdsSecretConfigs = append(
-				tlsCtx.DownstreamTlsContext.CommonTlsContext.TlsCertificateSdsSecretConfigs,
-				resolved)
-			continue
-		}
-
-		sdsConfig := &tlsv3.SdsSecretConfig{
-			Name:      cert.Name,
-			SdsConfig: makeConfigSource(),
-		}
-		if cert.SDS != nil {
-			// Use external SDS server instead of ADS
-			clusterName := sdsClusterNameFromURL(cert.SDS.GetURL())
-			sdsConfig = sdsSecretConfig(cert.SDS.SecretName, clusterName)
-		}
-		tlsCtx.DownstreamTlsContext.CommonTlsContext.TlsCertificateSdsSecretConfigs = append(
-			tlsCtx.DownstreamTlsContext.CommonTlsContext.TlsCertificateSdsSecretConfigs,
-			sdsConfig)
-	}
+	tlsCtx.DownstreamTlsContext.CommonTlsContext.TlsCertificateSdsSecretConfigs = append(
+		tlsCtx.DownstreamTlsContext.CommonTlsContext.TlsCertificateSdsSecretConfigs,
+		downstreamTLSCertificateConfigs(tlsConfig, certResolutions)...)
 
 	if tlsConfig.CACertificate != nil || tlsConfig.ClientValidationEnabled {
 		tlsCtx.DownstreamTlsContext.RequireClientCertificate = &wrapperspb.BoolValue{Value: tlsConfig.RequireClientCertificate}
@@ -966,35 +1027,9 @@ func buildXdsDownstreamTLSSocket(tlsConfig *ir.TLSConfig, certResolutions map[st
 		},
 	}
 
-	for _, cert := range tlsConfig.Certificates {
-		if cert.ExtensionRef != nil {
-			// Resolved by an extension server. The returned config is used verbatim: when the
-			// data plane resolves the name itself, SdsConfig is nil and must stay nil, so no
-			// default config source is substituted here. A certificate with no resolution is
-			// omitted so the listener fails closed.
-			resolved, ok := certResolutions[cert.Name]
-			if !ok || resolved == nil {
-				continue
-			}
-			tlsCtx.CommonTlsContext.TlsCertificateSdsSecretConfigs = append(
-				tlsCtx.CommonTlsContext.TlsCertificateSdsSecretConfigs,
-				resolved)
-			continue
-		}
-
-		sdsConfig := &tlsv3.SdsSecretConfig{
-			Name:      cert.Name,
-			SdsConfig: makeConfigSource(),
-		}
-		if cert.SDS != nil {
-			// Use external SDS server instead of ADS
-			clusterName := sdsClusterNameFromURL(cert.SDS.GetURL())
-			sdsConfig = sdsSecretConfig(cert.SDS.SecretName, clusterName)
-		}
-		tlsCtx.CommonTlsContext.TlsCertificateSdsSecretConfigs = append(
-			tlsCtx.CommonTlsContext.TlsCertificateSdsSecretConfigs,
-			sdsConfig)
-	}
+	tlsCtx.CommonTlsContext.TlsCertificateSdsSecretConfigs = append(
+		tlsCtx.CommonTlsContext.TlsCertificateSdsSecretConfigs,
+		downstreamTLSCertificateConfigs(tlsConfig, certResolutions)...)
 
 	if tlsConfig.CACertificate != nil || tlsConfig.ClientValidationEnabled {
 		tlsCtx.RequireClientCertificate = &wrapperspb.BoolValue{Value: tlsConfig.RequireClientCertificate}
@@ -1557,6 +1592,13 @@ func (t *Translator) resolveExtensionCertificates(
 func splitIRListenerName(name string) (namespace, gateway, listener string) {
 	parts := strings.Split(name, "/")
 	switch len(parts) {
+	case 5:
+		// A listener contributed by a ListenerSet is named
+		// gatewayNamespace/gatewayName/listenerSetNamespace/listenerSetName/listenerName.
+		// The Gateway is still what identifies the consumer -- an extension resolving a
+		// certificate needs to know which Gateway is asking, not which ListenerSet the
+		// listener came from -- so the middle pair is dropped.
+		return parts[0], parts[1], parts[4]
 	case 3:
 		return parts[0], parts[1], parts[2]
 	case 2:

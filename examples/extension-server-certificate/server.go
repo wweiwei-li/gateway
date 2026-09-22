@@ -6,8 +6,9 @@
 // certificates from a custom resource, using the TLSCertificate hook.
 //
 // It stands in for a provider whose data plane holds the certificate itself and resolves a
-// secret name internally -- the Phoenix ACM Certificate Server is the motivating case. For
-// such a provider the entire xDS contribution is a name on the filter chain:
+// secret name internally -- for example a hosted certificate service, an HSM-backed CA, or a
+// data plane with its own certificate store. For such a provider the entire xDS contribution is
+// a name on the filter chain:
 //
 //	tls_certificate_sds_secret_configs:
 //	- name: "<identifier>"
@@ -46,6 +47,19 @@ type certificateServer struct {
 	// identifierField is the path within the resource's spec holding the identifier the data
 	// plane knows the certificate by, expressed as a JSON field name.
 	identifierField string
+
+	// refuse, when set, makes every resolution return this as the FailureReason instead of an
+	// identifier. It models a provider whose certificate is not yet usable, so the listener
+	// fails closed. Left empty in normal operation.
+	refuse string
+
+	// stampIdentifier, when set, is returned verbatim as the identifier regardless of the
+	// resource's spec. It exists so a caller can prove the hook result is what reaches the
+	// filter chain, rather than a value Envoy Gateway derived some other way.
+	stampIdentifier string
+
+	// quiet suppresses per-resolution logging, for tests that drive many translations.
+	quiet bool
 }
 
 // PostTLSCertificateResolve tells Envoy Gateway how to reference one listener certificate.
@@ -72,26 +86,42 @@ func (s *certificateServer) PostTLSCertificateResolve(
 		return nil, err
 	}
 
-	identifier, found, err := unstructured.NestedString(obj.Object, "spec", s.identifierField)
-	if err != nil {
-		return nil, fmt.Errorf("reading spec.%s of %s/%s: %w",
-			s.identifierField, obj.GetNamespace(), obj.GetName(), err)
-	}
-	if !found || identifier == "" {
-		// Reported as a resolution failure rather than a gRPC error: the reference is
-		// structurally fine, the resource is simply not usable. Envoy Gateway treats the
-		// certificate as unresolved and omits it, so the listener fails closed.
+	// A provider that cannot yet serve the certificate returns a failure reason. Envoy Gateway
+	// omits the certificate, so the listener fails closed rather than referencing something the
+	// data plane does not have.
+	if s.refuse != "" {
 		return &extension.PostTLSCertificateResolveResponse{
-			FailureReason: "MissingIdentifier",
-			FailureMessage: fmt.Sprintf("%s/%s has no spec.%s",
-				obj.GetNamespace(), obj.GetName(), s.identifierField),
+			FailureReason:  s.refuse,
+			FailureMessage: fmt.Sprintf("%s/%s is not yet usable", obj.GetNamespace(), obj.GetName()),
 		}, nil
 	}
 
-	log.Printf("resolved certificate %s/%s for %s/%s listener %q -> %q",
-		obj.GetNamespace(), obj.GetName(),
-		certCtx.GetGatewayNamespace(), certCtx.GetGatewayName(), certCtx.GetListenerName(),
-		identifier)
+	identifier := s.stampIdentifier
+	if identifier == "" {
+		var found bool
+		identifier, found, err = unstructured.NestedString(obj.Object, "spec", s.identifierField)
+		if err != nil {
+			return nil, fmt.Errorf("reading spec.%s of %s/%s: %w",
+				s.identifierField, obj.GetNamespace(), obj.GetName(), err)
+		}
+		if !found || identifier == "" {
+			// Reported as a resolution failure rather than a gRPC error: the reference is
+			// structurally fine, the resource is simply not usable. Envoy Gateway treats the
+			// certificate as unresolved and omits it, so the listener fails closed.
+			return &extension.PostTLSCertificateResolveResponse{
+				FailureReason: "MissingIdentifier",
+				FailureMessage: fmt.Sprintf("%s/%s has no spec.%s",
+					obj.GetNamespace(), obj.GetName(), s.identifierField),
+			}, nil
+		}
+	}
+
+	if !s.quiet {
+		log.Printf("resolved certificate %s/%s for %s/%s listener %q -> %q",
+			obj.GetNamespace(), obj.GetName(),
+			certCtx.GetGatewayNamespace(), certCtx.GetGatewayName(), certCtx.GetListenerName(),
+			identifier)
+	}
 
 	return &extension.PostTLSCertificateResolveResponse{
 		// No SdsConfig: the data plane resolves this name from its own certificate store.
@@ -120,12 +150,21 @@ func decodeResource(res *extension.ExtensionResource) (*unstructured.Unstructure
 func main() {
 	var (
 		addr            = flag.String("address", ":5005", "address to serve on; a path is treated as a unix socket")
+		socket          = flag.String("socket", "", "unix socket path to serve on; overrides --address when set")
 		identifierField = flag.String("identifier-field", "certificateArn",
 			"field under spec holding the identifier the data plane knows the certificate by")
+		refuse = flag.String("refuse", "",
+			"when set, refuse every resolution with this reason, modelling a not-yet-usable certificate")
+		stampIdentifier = flag.String("stamp-identifier", "",
+			"when set, return this identifier verbatim regardless of the resource spec")
+		quiet = flag.Bool("quiet", false, "suppress per-resolution logging")
 	)
 	flag.Parse()
 
 	network, address := "tcp", *addr
+	if *socket != "" {
+		address = *socket
+	}
 	if len(address) > 0 && address[0] == '/' {
 		// A unix socket keeps the server unreachable over the network, which suits running it
 		// as a sidecar of the Envoy Gateway pod.
@@ -141,7 +180,12 @@ func main() {
 	}
 
 	srv := grpc.NewServer()
-	extension.RegisterEnvoyGatewayExtensionServer(srv, &certificateServer{identifierField: *identifierField})
+	extension.RegisterEnvoyGatewayExtensionServer(srv, &certificateServer{
+		identifierField: *identifierField,
+		refuse:          *refuse,
+		stampIdentifier: *stampIdentifier,
+		quiet:           *quiet,
+	})
 
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)

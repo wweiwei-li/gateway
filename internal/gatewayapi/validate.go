@@ -334,14 +334,14 @@ func (t *Translator) validateListenerConditions(listener *ListenerContext) {
 			listener.SetCondition(gwapiv1.ListenerConditionProgrammed, metav1.ConditionFalse, gwapiv1.ListenerReasonInvalid,
 				"Listener is invalid, see other Conditions for details.")
 			return
-		case string(status.ReasonCertificatePending):
+		case string(gwapiv1.ListenerReasonPending):
 			// An extension-provided certificate is not ready yet. The configuration is
 			// correct and the reference resolved, so this is a transient state rather than
 			// an error: the listener is accepted but deliberately not programmed, so it
 			// never serves without the certificate it was told to use.
 			listener.SetCondition(gwapiv1.ListenerConditionAccepted, metav1.ConditionTrue, gwapiv1.ListenerReasonAccepted,
 				"Listener has been successfully translated")
-			listener.SetCondition(gwapiv1.ListenerConditionProgrammed, metav1.ConditionFalse, status.ReasonCertificatePending,
+			listener.SetCondition(gwapiv1.ListenerConditionProgrammed, metav1.ConditionFalse, gwapiv1.ListenerReasonPending,
 				"Listener is waiting for a certificate to become ready, see other Conditions for details.")
 			return
 		}
@@ -451,19 +451,84 @@ func (t *Translator) validateAllowedNamespaces(listener *ListenerContext) bool {
 	return true
 }
 
-// extensionCertificateReady reports whether an extension-provided certificate resource is
-// ready to be served, based on the standard Ready condition its provider is expected to
+// extensionCertificateReady reports whether an extension-provided certificate resource is ready
+// to be served by the named Gateway, based on the Ready condition its provider is expected to
 // publish. Envoy Gateway does not interpret anything else about the resource.
 //
-// A missing condition is treated as not ready: the provider has not yet made a statement,
-// and admitting the reference would program a listener against a certificate that may not
-// exist on the data plane.
-func extensionCertificateReady(obj *unstructured.Unstructured) (ready bool, reason, message string) {
+// A provider may report readiness in either of two shapes.
+//
+// Per consumer, in status.consumers, when the same certificate can be ready for one Gateway and
+// not yet for another. This follows the shape Gateway API uses for status that varies by target:
+// a structured reference identifying the consumer, plus that consumer's own conditions. The list
+// is treated as a map keyed by the reference, as PolicyAncestorStatus specifies.
+//
+// Once per certificate, in status.conditions, when readiness does not vary by consumer. This is
+// the simpler and more common case, and it stays the default: a provider that does not populate
+// status.consumers keeps working unchanged.
+//
+// A missing statement is treated as not ready in both shapes. If status.consumers is present but
+// names no entry for this Gateway, the provider has not said anything about this consumer, and
+// admitting the reference would program a listener against a certificate that may not be on the
+// proxy backing it.
+func extensionCertificateReady(obj *unstructured.Unstructured, gatewayNamespace, gatewayName string) (ready bool, reason, message string) {
+	if consumers, found, err := unstructured.NestedSlice(obj.Object, "status", "consumers"); err == nil && found {
+		cond, matched := consumerConditions(consumers, gatewayNamespace, gatewayName)
+		if !matched {
+			return false, string(gwapiv1.ListenerReasonPending),
+				fmt.Sprintf("Certificate reports no readiness for Gateway %s/%s", gatewayNamespace, gatewayName)
+		}
+		return readyFromConditions(cond)
+	}
 	conditions, found, err := unstructured.NestedSlice(obj.Object, "status", "conditions")
 	if err != nil || !found {
-		return false, string(status.ReasonCertificatePending), "Certificate does not yet report a Ready condition"
+		return false, string(gwapiv1.ListenerReasonPending), "Certificate does not yet report a Ready condition"
 	}
+	return readyFromConditions(conditions)
+}
 
+// consumerConditions returns the conditions the provider published for one Gateway, and whether an
+// entry for it was found.
+//
+// Entries are matched on the consumer reference alone. controllerName is deliberately not part of
+// the match: it names the controller that wrote the entry, which is the certificate's provider, and
+// Envoy Gateway has no way to know that name.
+func consumerConditions(consumers []interface{}, gatewayNamespace, gatewayName string) ([]interface{}, bool) {
+	for _, c := range consumers {
+		entry, ok := c.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		// The reference is optional in shape but required in practice; an entry without one
+		// identifies no consumer and is skipped rather than matched against everything.
+		refNamespace, _, _ := unstructured.NestedString(entry, "consumerRef", "namespace")
+		refName, _, _ := unstructured.NestedString(entry, "consumerRef", "name")
+		if refNamespace != gatewayNamespace || refName != gatewayName {
+			continue
+		}
+		// A ListenerSet listener is still consumed on behalf of its Gateway, because the proxy
+		// serving it is the Gateway's, so only Gateway references are matched.
+		//
+		// Group is matched as well as Kind because "Gateway" is not a unique kind -- other APIs
+		// define one too -- so kind alone would let an entry describing an unrelated object
+		// satisfy the gate for a Gateway API Gateway of the same namespace and name. Both
+		// default to the Gateway API Gateway when empty.
+		if refKind, _, _ := unstructured.NestedString(entry, "consumerRef", "kind"); refKind != "" && refKind != resource.KindGateway {
+			continue
+		}
+		if refGroup, _, _ := unstructured.NestedString(entry, "consumerRef", "group"); refGroup != "" && refGroup != gwapiv1.GroupName {
+			continue
+		}
+		conditions, found, err := unstructured.NestedSlice(entry, "conditions")
+		if err != nil || !found {
+			return nil, true
+		}
+		return conditions, true
+	}
+	return nil, false
+}
+
+// readyFromConditions reads a Ready condition out of a conditions list.
+func readyFromConditions(conditions []interface{}) (ready bool, reason, message string) {
 	for _, c := range conditions {
 		cond, ok := c.(map[string]interface{})
 		if !ok {
@@ -473,26 +538,23 @@ func extensionCertificateReady(obj *unstructured.Unstructured) (ready bool, reas
 		if condType != "Ready" {
 			continue
 		}
-
 		condStatus, _, _ := unstructured.NestedString(cond, "status")
 		condReason, _, _ := unstructured.NestedString(cond, "reason")
 		condMessage, _, _ := unstructured.NestedString(cond, "message")
-
 		if condStatus == string(metav1.ConditionTrue) {
 			return true, "", ""
 		}
 		// Forward the provider's own reason and message so the listener condition explains
 		// the delay in the provider's terms rather than a generic one.
 		if condReason == "" {
-			condReason = string(status.ReasonCertificatePending)
+			condReason = string(gwapiv1.ListenerReasonPending)
 		}
 		if condMessage == "" {
 			condMessage = "Certificate is not ready"
 		}
 		return false, condReason, condMessage
 	}
-
-	return false, string(status.ReasonCertificatePending), "Certificate does not yet report a Ready condition"
+	return false, string(gwapiv1.ListenerReasonPending), "Certificate does not yet report a Ready condition"
 }
 
 // resolveExtensionCertificateRef resolves a listener certificate ref that points at a kind
@@ -555,14 +617,14 @@ func (t *Translator) resolveExtensionCertificateRef(
 		)
 	}
 
-	if ready, reason, message := extensionCertificateReady(obj); !ready {
+	if ready, reason, message := extensionCertificateReady(obj, listener.gateway.Namespace, listener.gateway.Name); !ready {
 		// Pending is not invalid: the configuration is correct and the certificate is
 		// expected to become available, so a stable reason is used and the provider's
 		// own reason and message are carried in the text for diagnosis.
 		return nil, status.NewListenerStatusError(
 			fmt.Errorf("certificate refs %d: %s %s/%s is not ready: %s: %s.",
 				idx, refKind, certNamespace, certificateRef.Name, reason, message),
-			status.ReasonCertificatePending,
+			gwapiv1.ListenerReasonPending,
 		)
 	}
 
@@ -726,7 +788,7 @@ func (t *Translator) validateTerminateModeAndGetTLSSecrets(
 		reason := gwapiv1.ListenerReasonRefNotPermitted
 		allPending := true
 		for _, err := range errs {
-			if err.Reason() != status.ReasonCertificatePending {
+			if err.Reason() != gwapiv1.ListenerReasonPending {
 				allPending = false
 			}
 			if err.Reason() != gwapiv1.ListenerReasonRefNotPermitted {
@@ -734,7 +796,7 @@ func (t *Translator) validateTerminateModeAndGetTLSSecrets(
 			}
 		}
 		if allPending {
-			reason = status.ReasonCertificatePending
+			reason = gwapiv1.ListenerReasonPending
 		}
 
 		errList := make([]error, len(errs))

@@ -37,7 +37,8 @@ status:
   conditions:
   # This is the admission gate. Envoy Gateway only admits the reference, and only calls the
   # resolve hook, once this reports True. Flip it to False and the listener becomes
-  # Programmed=False with reason CertificatePending while staying Accepted=True.
+  # Programmed=False with reason Pending while staying Accepted=True, and the reason and
+  # message below are surfaced on the listener's ResolvedRefs condition.
   - type: Ready
     status: "True"
     reason: Associated

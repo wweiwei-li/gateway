@@ -43,10 +43,6 @@ const (
 const (
 	ListenerReasonPartiallyInvalidCertificateRef gwapiv1.ListenerConditionReason = "PartiallyInvalidCertificateRef"
 	ListenerReasonSDSCertificateOpaque           gwapiv1.ListenerConditionReason = "SDSCertificateOpaque"
-
-	// ReasonCertificatePending is the fallback reason used when an extension-provided
-	// certificate is not yet ready and its provider offered no reason of its own.
-	ReasonCertificatePending gwapiv1.ListenerConditionReason = "CertificatePending"
 )
 
 // ListenerError is an error interface that represents errors that need to be reflected

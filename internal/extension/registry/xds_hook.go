@@ -203,8 +203,6 @@ func (h *XDSHook) PostTLSCertificateResolveHook(certCtx *types.TLSCertificateCon
 				GatewayNamespace:    certCtx.GatewayNamespace,
 				GatewayName:         certCtx.GatewayName,
 				ListenerName:        certCtx.ListenerName,
-				ListenerPort:        certCtx.ListenerPort,
-				ListenerHostname:    certCtx.ListenerHostname,
 			},
 		})
 	if err != nil {

@@ -74,11 +74,7 @@ type TLSCertificateContext struct {
 	GatewayNamespace string
 	GatewayName      string
 
-	// ListenerName is the listener's name as written in the Gateway spec.
 	ListenerName string
-	ListenerPort uint32
-	// ListenerHostname is empty when the listener accepts any hostname.
-	ListenerHostname string
 }
 
 // TLSCertificateResolution is how Envoy should obtain one listener TLS certificate.

@@ -531,3 +531,45 @@ func getTargetRefKind(obj *unstructured.Unstructured) (string, error) {
 
 	return kind, nil
 }
+
+// PostTLSCertificateResolve resolves a listener certificate based on the referenced resource's name:
+//   - "refuse-*" is refused with a failure reason, as a provider does while a certificate is not ready
+//   - "error-*" fails the call
+//   - "sds-*" resolves to a name fetched over SDS (ADS)
+//   - anything else resolves to a name only, built from the request context so the output shows
+//     which Gateway and listener the extension was asked about
+func (t *testingExtensionServer) PostTLSCertificateResolve(_ context.Context, req *pb.PostTLSCertificateResolveRequest) (*pb.PostTLSCertificateResolveResponse, error) {
+	certCtx := req.GetPostTlsCertificateContext()
+	var cert unstructured.Unstructured
+	if err := cert.UnmarshalJSON(certCtx.GetCertificateResource().GetUnstructuredBytes()); err != nil {
+		return nil, err
+	}
+
+	name := cert.GetName()
+	switch {
+	case strings.HasPrefix(name, "refuse-"):
+		return &pb.PostTLSCertificateResolveResponse{
+			FailureReason:  "NotReady",
+			FailureMessage: fmt.Sprintf("certificate %s is not ready", name),
+		}, nil
+	case strings.HasPrefix(name, "error-"):
+		return nil, errors.New("certificate resolve error")
+	case strings.HasPrefix(name, "sds-"):
+		return &pb.PostTLSCertificateResolveResponse{
+			SdsSecretConfig: &tlsV3.SdsSecretConfig{
+				Name: "sds/" + name,
+				SdsConfig: &coreV3.ConfigSource{
+					ResourceApiVersion:    coreV3.ApiVersion_V3,
+					ConfigSourceSpecifier: &coreV3.ConfigSource_Ads{Ads: &coreV3.AggregatedConfigSource{}},
+				},
+			},
+		}, nil
+	default:
+		return &pb.PostTLSCertificateResolveResponse{
+			SdsSecretConfig: &tlsV3.SdsSecretConfig{
+				Name: fmt.Sprintf("%s/%s/%s/%s", certCtx.GetGatewayNamespace(), certCtx.GetGatewayName(),
+					certCtx.GetListenerName(), name),
+			},
+		}, nil
+	}
+}

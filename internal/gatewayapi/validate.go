@@ -14,10 +14,14 @@ import (
 	"strings"
 
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/apimachinery/pkg/util/validation"
+	"k8s.io/utils/ptr"
 	gwapiv1 "sigs.k8s.io/gateway-api/apis/v1"
 	gwapiv1a2 "sigs.k8s.io/gateway-api/apis/v1alpha2"
 
@@ -333,6 +337,13 @@ func (t *Translator) validateListenerConditions(listener *ListenerContext) {
 			listener.SetCondition(gwapiv1.ListenerConditionProgrammed, metav1.ConditionFalse, gwapiv1.ListenerReasonInvalid,
 				"Listener is invalid, see other Conditions for details.")
 			return
+		case string(gwapiv1.ListenerReasonPending):
+			// An extension-provided certificate is not ready yet: accept the listener but don't program it.
+			listener.SetCondition(gwapiv1.ListenerConditionAccepted, metav1.ConditionTrue, gwapiv1.ListenerReasonAccepted,
+				"Listener has been successfully translated")
+			listener.SetCondition(gwapiv1.ListenerConditionProgrammed, metav1.ConditionFalse, gwapiv1.ListenerReasonPending,
+				"Listener is waiting for a certificate to become ready, see other Conditions for details.")
+			return
 		}
 	}
 
@@ -440,10 +451,125 @@ func (t *Translator) validateAllowedNamespaces(listener *ListenerContext) bool {
 	return true
 }
 
+// extensionCertificateStatus is the part of an extension certificate's status Envoy Gateway reads.
+type extensionCertificateStatus struct {
+	Conditions []metav1.Condition `json:"conditions,omitempty"`
+	Consumers  []struct {
+		ConsumerRef gwapiv1.ParentReference `json:"consumerRef"`
+		Conditions  []metav1.Condition      `json:"conditions,omitempty"`
+	} `json:"consumers,omitempty"`
+}
+
+// extensionCertificateReady reports whether an extension certificate is Ready for the given Gateway
+// listener. When status.consumers is set, the entry for this listener (or else this Gateway) is used;
+// otherwise status.conditions. If not ready, it returns a message explaining why.
+func extensionCertificateReady(obj *unstructured.Unstructured, gwNamespace, gwName, listenerName string) (bool, string) {
+	var st extensionCertificateStatus
+	statusObj, _, _ := unstructured.NestedMap(obj.Object, "status")
+	if err := runtime.DefaultUnstructuredConverter.FromUnstructured(statusObj, &st); err != nil {
+		return false, fmt.Sprintf("status could not be read: %v", err)
+	}
+
+	conditions := st.Conditions
+	if st.Consumers != nil {
+		conditions = nil
+		for _, c := range st.Consumers {
+			// Only Gateway API Gateways are consumers; an empty group or kind defaults to them.
+			ref := c.ConsumerRef
+			group, kind := string(ptr.Deref(ref.Group, "")), string(ptr.Deref(ref.Kind, ""))
+			if (group != "" && group != gwapiv1.GroupName) || (kind != "" && kind != resource.KindGateway) ||
+				string(ptr.Deref(ref.Namespace, "")) != gwNamespace || string(ref.Name) != gwName {
+				continue
+			}
+			section := string(ptr.Deref(ref.SectionName, ""))
+			if section == listenerName {
+				conditions = c.Conditions
+				break
+			}
+			if section == "" && conditions == nil {
+				conditions = c.Conditions
+			}
+		}
+	}
+
+	ready := meta.FindStatusCondition(conditions, "Ready")
+	switch {
+	case ready == nil:
+		return false, "no Ready condition reported"
+	case ready.Status != metav1.ConditionTrue:
+		return false, fmt.Sprintf("%s: %s", ready.Reason, ready.Message)
+	}
+	return true, ""
+}
+
+// resolveExtensionCertificateRef checks a listener certificate ref to a kind registered in
+// ExtensionManager.CertificateResources: that it is permitted, exists, and is Ready.
+func (t *Translator) resolveExtensionCertificateRef(
+	listener *ListenerContext,
+	certificateRef gwapiv1.SecretObjectReference,
+	refGroup, refKind string,
+	idx int,
+	resources *resource.Resources,
+) (*unstructured.Unstructured, status.ListenerError) {
+	listenerNamespace := listener.GetNamespace()
+	certNamespace := listenerNamespace
+
+	if certificateRef.Namespace != nil && string(*certificateRef.Namespace) != "" &&
+		string(*certificateRef.Namespace) != listenerNamespace {
+		fromGroup := gwapiv1.GroupName
+		fromKind := resource.KindGateway
+		if listener.isFromListenerSet() {
+			fromGroup = gwapiv1.GroupVersion.Group
+			fromKind = resource.KindListenerSet
+		}
+
+		if !isCrossNamespaceReferencePermitted(
+			crossNamespaceFrom{
+				group:     fromGroup,
+				kind:      fromKind,
+				namespace: listenerNamespace,
+			},
+			crossNamespaceTo{
+				group:     refGroup,
+				kind:      refKind,
+				namespace: string(*certificateRef.Namespace),
+				name:      string(certificateRef.Name),
+			},
+			resources.ReferenceGrants,
+		) {
+			return nil, status.NewListenerStatusError(
+				fmt.Errorf("certificate refs %d: Certificate ref to %s %s/%s not permitted by any ReferenceGrant.",
+					idx, refKind, *certificateRef.Namespace, certificateRef.Name),
+				gwapiv1.ListenerReasonRefNotPermitted,
+			)
+		}
+
+		certNamespace = string(*certificateRef.Namespace)
+	}
+
+	obj := resources.GetExtensionCertificate(refGroup, refKind, certNamespace, string(certificateRef.Name))
+	if obj == nil {
+		return nil, status.NewListenerStatusError(
+			fmt.Errorf("certificate refs %d: %s %s/%s does not exist.", idx, refKind, certNamespace, certificateRef.Name),
+			gwapiv1.ListenerReasonInvalidCertificateRef,
+		)
+	}
+
+	if ready, message := extensionCertificateReady(obj, listener.gateway.Namespace, listener.gateway.Name, string(listener.Name)); !ready {
+		return nil, status.NewListenerStatusError(
+			fmt.Errorf("certificate refs %d: %s %s/%s is not ready: %s.",
+				idx, refKind, certNamespace, certificateRef.Name, message),
+			gwapiv1.ListenerReasonPending,
+		)
+	}
+
+	return obj, nil
+}
+
 func (t *Translator) validateTerminateModeAndGetTLSSecrets(
 	listener *ListenerContext,
 	resources *resource.Resources,
-) ([]*corev1.Secret, []*x509.Certificate, bool) {
+) ([]*corev1.Secret, []unstructured.Unstructured, []*x509.Certificate, bool) {
 	if len(listener.TLS.CertificateRefs) == 0 {
 		listener.SetCondition(
 			gwapiv1.ListenerConditionProgrammed,
@@ -451,16 +577,36 @@ func (t *Translator) validateTerminateModeAndGetTLSSecrets(
 			gwapiv1.ListenerReasonInvalid,
 			"Listener must have at least 1 TLS certificate ref",
 		)
-		return nil, nil, false
+		return nil, nil, nil, false
 	}
 
 	var errs []status.ListenerError
 	tlsSecrets := make([]*corev1.Secret, 0, len(listener.TLS.CertificateRefs))
 	sdsSecrets := make([]*corev1.Secret, 0, len(listener.TLS.CertificateRefs))
 	orderedSecrets := make([]*corev1.Secret, 0, len(listener.TLS.CertificateRefs))
+	extensionCerts := make([]unstructured.Unstructured, 0, len(listener.TLS.CertificateRefs))
 	resolvedSDSSecretNames := make(map[types.NamespacedName]struct{})
 	for idx, certificateRef := range listener.TLS.CertificateRefs {
-		if certificateRef.Group != nil && string(*certificateRef.Group) != "" {
+		refGroup, refKind := "", resource.KindSecret
+		if certificateRef.Group != nil {
+			refGroup = string(*certificateRef.Group)
+		}
+		if certificateRef.Kind != nil && string(*certificateRef.Kind) != "" {
+			refKind = string(*certificateRef.Kind)
+		}
+
+		// A ref to a kind registered in ExtensionManager.CertificateResources is resolved by an extension.
+		if t.isExtensionCertificateRef(refGroup, refKind) {
+			cert, err := t.resolveExtensionCertificateRef(listener, certificateRef, refGroup, refKind, idx, resources)
+			if err != nil {
+				errs = append(errs, err)
+				continue
+			}
+			extensionCerts = append(extensionCerts, *cert)
+			continue
+		}
+
+		if refGroup != "" {
 			errs = append(errs, status.NewListenerStatusError(
 				fmt.Errorf("certificate refs %d: Listener's TLS certificate ref group must be unspecified/empty.", idx),
 				gwapiv1.ListenerReasonInvalidCertificateRef,
@@ -570,7 +716,7 @@ func (t *Translator) validateTerminateModeAndGetTLSSecrets(
 		orderedSecrets = append(orderedSecrets, secret)
 	}
 
-	if len(tlsSecrets)+len(sdsSecrets) == 0 {
+	if len(tlsSecrets)+len(sdsSecrets)+len(extensionCerts) == 0 {
 		// Use RefNotPermitted only if ALL errors are RefNotPermitted
 		// Otherwise use InvalidCertificateRef as the general catch-all
 		reason := gwapiv1.ListenerReasonRefNotPermitted
@@ -579,6 +725,12 @@ func (t *Translator) validateTerminateModeAndGetTLSSecrets(
 				reason = gwapiv1.ListenerReasonInvalidCertificateRef
 				break
 			}
+		}
+		// Only extension certificates that are not ready yet: the listener is pending, not invalid.
+		if !slices.ContainsFunc(errs, func(e status.ListenerError) bool {
+			return e.Reason() != gwapiv1.ListenerReasonPending
+		}) {
+			reason = gwapiv1.ListenerReasonPending
 		}
 
 		errList := make([]error, len(errs))
@@ -593,13 +745,13 @@ func (t *Translator) validateTerminateModeAndGetTLSSecrets(
 			fmt.Sprintf("No valid secrets exist: %v", errors.Join(errList...)),
 		)
 
-		return nil, nil, false
+		return nil, nil, nil, false
 	}
 
 	validSecrets, certs, err := parseCertsFromTLSSecretsData(tlsSecrets)
 	if err != nil {
 		if err.Reason() != status.ListenerReasonPartiallyInvalidCertificateRef {
-			if len(validSecrets) == 0 && len(sdsSecrets) > 0 {
+			if len(validSecrets) == 0 && len(sdsSecrets)+len(extensionCerts) > 0 {
 				errs = append(errs, err)
 			} else {
 				listener.SetCondition(
@@ -608,7 +760,7 @@ func (t *Translator) validateTerminateModeAndGetTLSSecrets(
 					err.Reason(),
 					fmt.Sprintf("No valid secrets exist: %v.", err.Error()),
 				)
-				return nil, nil, false
+				return nil, nil, nil, false
 			}
 		} else {
 			errs = append(errs, err)
@@ -650,7 +802,7 @@ func (t *Translator) validateTerminateModeAndGetTLSSecrets(
 		validTLSSecretsByName[name] = matchingSecrets[1:]
 	}
 
-	return resolvedSecrets, certs, true
+	return resolvedSecrets, extensionCerts, certs, true
 }
 
 // validateTLSConfiguration validates TLS configuration per protocol.
@@ -691,8 +843,9 @@ func (t *Translator) validateTLSConfiguration(
 				)
 				specValid = false
 			} else {
-				secrets, certs, ok := t.validateTerminateModeAndGetTLSSecrets(listener, resources)
+				secrets, extCerts, certs, ok := t.validateTerminateModeAndGetTLSSecrets(listener, resources)
 				listener.SetTLSSecrets(secrets)
+				listener.SetTLSExtensionCertificates(extCerts)
 
 				if !ok {
 					specValid = false
@@ -736,8 +889,9 @@ func (t *Translator) validateTLSConfiguration(
 					)
 					specValid = false
 				} else {
-					secrets, _, ok := t.validateTerminateModeAndGetTLSSecrets(listener, resources)
+					secrets, extCerts, _, ok := t.validateTerminateModeAndGetTLSSecrets(listener, resources)
 					listener.SetTLSSecrets(secrets)
+					listener.SetTLSExtensionCertificates(extCerts)
 
 					if !ok {
 						specValid = false

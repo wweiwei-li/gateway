@@ -552,6 +552,12 @@ func checkOverlappingCertificates(httpsListeners []*ListenerContext) {
 		}
 		validListenerCountByPort[listener.Port]++
 
+		// Like SDS certificates, extension certificates are opaque: their SANs are unknown.
+		if len(listener.tls.extensionCertificates) > 0 {
+			sdsListenersByPort[listener.Port] = append(sdsListenersByPort[listener.Port], listener)
+			continue
+		}
+
 		for _, secret := range listener.tls.secrets {
 			if secret.Type == egv1a1.SDSSecretType {
 				sdsListenersByPort[listener.Port] = append(sdsListenersByPort[listener.Port], listener)

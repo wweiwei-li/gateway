@@ -125,6 +125,9 @@ The hooks are executed in the following order during xDS translation:
   listener's certificates are resolved, Envoy closes the connections for the listener's hostnames, rather than
   letting another listener on the same port, such as one with a wildcard hostname, handle them. HTTP/3 traffic
   for the listener is not served.
+- **Re-resolution**: Envoy Gateway calls the hook again only when it translates again. When a certificate
+  becomes resolvable or stops being resolvable, update the referenced resource, for example its status, so
+  Envoy Gateway translates again and picks up the change.
 - **Errors**: A hook error fails translation even when `failOpen` is set, so Envoy keeps its last good
   configuration. Report a certificate that cannot be served yet with a failure reason, not an error.
 
